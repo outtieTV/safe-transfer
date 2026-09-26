@@ -1,646 +1,455 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 Safe Transfer - Windows File Copy / Move Assistant
+===================================================
 
-Features:
-    - Copy or move files
-    - Creates the complete destination folder structure first
-    - Scans files and builds a persistent transfer manifest
-    - Transfer order:
-        * Largest -> Smallest
-        * Smallest -> Largest
-    - Pause / resume
-    - Skip existing files
-    - Optional verification
-    - Missing-file scan
-    - Windows "Size on Disk" statistics
-    - Destination volume statistics
-    - Explicit "Scan Source & Destination Size" button
-    - Detailed logging
-    - JSON pause/resume state
-    - PyQt6 GUI
+PyQt6 application providing:
 
-Python:
-    3.10+
+    • Copy files
+    • Move files
+    • Find missing files
+    • Copy missing files
+    • Create destination folder structure before transferring files
+    • Sort transfers largest -> smallest
+    • Sort transfers smallest -> largest
+    • Save file-size scan information to a text document
+    • Pause / Resume
+    • Skip existing files with the same size
+    • Optional free-space pre-flight check
+    • Progress reporting
+    • Transfer speed
+    • Byte-based ETA
+    • Estimated completion time using local computer time
+    • Source / destination filesystem statistics
+    • Persistent logging
+    • JSON pause/resume state
+    • Per-file error handling
+    • Optional file-size verification
+    • Background worker threads
+    • Windows-friendly filesystem handling
+    • Junction/symlink protection
+    • Manual folder statistics scan
+    • Optional shutdown when transfer completes
+    • Large directory support
 
-Dependencies:
+Requirements:
+
+    Python 3.10+
     PyQt6
+
+Install:
+
+    py -m pip install PyQt6
+
+Run:
+
+    py safe-transfer.pyw
+
+Log:
+
+    %USERPROFILE%\\copy_move_history.txt
+
+State:
+
+    .pauseResumeState.json
+
+File-size scan:
+
+    transfer_file_sizes.txt
 """
 
-from __future__ import annotations
-
-import ctypes
-import json
-import os
-import shutil
 import sys
+import os
+import json
 import time
-import traceback
+import shutil
+import subprocess
 
-from ctypes import wintypes
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Tuple
+
+try:
+    import humanize
+except ImportError:
+    humanize = None
 
 from PyQt6.QtCore import (
-    QObject,
+    Qt,
     QThread,
-    QTimer,
     pyqtSignal,
-    pyqtSlot,
 )
 
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
+    QWidget,
     QLabel,
     QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
     QPushButton,
-    QPlainTextEdit,
-    QRadioButton,
+    QFileDialog,
     QVBoxLayout,
-    QWidget,
+    QHBoxLayout,
+    QTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QCheckBox,
+    QComboBox,
+    QGroupBox,
 )
 
 
-# ============================================================
-# Configuration
-# ============================================================
+# ======================================================================
+# PATHS
+# ======================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 LOG_FILE = Path.home() / "copy_move_history.txt"
+
 STATE_FILE = SCRIPT_DIR / ".pauseResumeState.json"
 
-TRANSFER_MANIFEST = SCRIPT_DIR / "transfer_file_list.txt"
-
-BUFFER_SIZE = 1024 * 1024
-
-STATS_DEBOUNCE_MS = 500
-
-FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-
-INVALID_FILE_SIZE = 0xFFFFFFFF
-
-ERROR_SUCCESS = 0
+SIZE_LIST_FILE = SCRIPT_DIR / "transfer_file_sizes.txt"
 
 
-# ============================================================
-# Windows API
-# ============================================================
-
-if os.name == "nt":
-
-    kernel32 = ctypes.WinDLL(
-        "kernel32",
-        use_last_error=True,
-    )
-
-    kernel32.GetCompressedFileSizeW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-
-    kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD
-
-    kernel32.GetDiskFreeSpaceExW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.POINTER(ctypes.c_ulonglong),
-        ctypes.POINTER(ctypes.c_ulonglong),
-        ctypes.POINTER(ctypes.c_ulonglong),
-    ]
-
-    kernel32.GetDiskFreeSpaceExW.restype = wintypes.BOOL
-
-
-# ============================================================
-# Formatting
-# ============================================================
+# ======================================================================
+# GENERAL UTILITIES
+# ======================================================================
 
 def human_bytes(value: int | float) -> str:
     """
-    Format bytes using IEC units.
+    Format bytes using binary units.
+
+    Falls back to an internal formatter if humanize is not installed.
     """
 
-    value = float(value)
+    value = max(0, int(value))
 
-    units = (
+    if humanize:
+        return humanize.naturalsize(
+            value,
+            binary=True,
+        )
+
+    units = [
         "B",
         "KiB",
         "MiB",
         "GiB",
         "TiB",
         "PiB",
-        "EiB",
-    )
+    ]
 
-    index = 0
+    size = float(value)
 
-    while abs(value) >= 1024 and index < len(units) - 1:
-        value /= 1024
-        index += 1
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} B"
 
-    if index == 0:
-        return f"{int(value):,} {units[index]}"
+            return f"{size:.2f} {unit}"
 
-    return f"{value:,.2f} {units[index]}"
+        size /= 1024
+
+    return f"{value} B"
 
 
 def format_seconds(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
+    """Convert seconds to HHh MMm SSs."""
 
-    seconds = int(seconds)
+    if seconds <= 0:
+        return "—"
 
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    seconds = max(0, int(seconds))
 
-    if hours:
-        return f"{hours}h {minutes}m {seconds}s"
+    hours, remainder = divmod(
+        seconds,
+        3600,
+    )
 
-    if minutes:
-        return f"{minutes}m {seconds}s"
+    minutes, seconds = divmod(
+        remainder,
+        60,
+    )
 
-    return f"{seconds}s"
+    return (
+        f"{hours:02d}h "
+        f"{minutes:02d}m "
+        f"{seconds:02d}s"
+    )
 
 
-# ============================================================
-# Logging
-# ============================================================
+def format_completion_time(seconds: float) -> str:
+    """
+    Return the estimated completion time using the computer's
+    local timezone.
+    """
 
-def write_log(message: str) -> None:
+    if seconds <= 0:
+        return "—"
 
-    timestamp = time.strftime(
+    timestamp = (
+        time.time()
+        + seconds
+    )
+
+    return datetime.fromtimestamp(
+        timestamp
+    ).astimezone().strftime(
+        "%Y-%m-%d %I:%M:%S %p"
+    )
+
+
+def free_space(path: Path) -> int:
+    """
+    Return free space on the filesystem containing path.
+    """
+
+    target = (
+        path
+        if path.exists()
+        else path.parent
+    )
+
+    return shutil.disk_usage(
+        target
+    ).free
+
+
+def append_log(message: str):
+    """Append a timestamped message to the persistent log."""
+
+    timestamp = datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
-    line = f"[{timestamp}] {message}"
+    line = (
+        f"{timestamp}\t{message}"
+    )
 
     try:
         with LOG_FILE.open(
             "a",
             encoding="utf-8",
-        ) as handle:
-
-            handle.write(line + "\n")
+        ) as f:
+            f.write(
+                line + "\n"
+            )
 
     except Exception:
         pass
 
 
-# ============================================================
-# Windows Size on Disk
-# ============================================================
+# ======================================================================
+# FOLDER STATISTICS
+# ======================================================================
 
-def get_file_size_on_disk(path: Path) -> int:
+@dataclass
+class FolderStats:
+    logical_size: int = 0
+    file_count: int = 0
+    directory_count: int = 0
+    errors: int = 0
+    reparse_points: int = 0
+    largest_file_size: int = 0
+    largest_file_path: str = ""
+
+
+def get_windows_allocated_size(
+    path: Path,
+) -> int | None:
     """
-    Get the Windows allocated size of a file.
+    Attempt to determine Windows' allocated size for a file.
 
-    Uses GetCompressedFileSizeW(), which handles sparse and
-    compressed files better than simply using st_size.
+    This uses GetCompressedFileSizeW through ctypes.
 
-    Falls back to st_blocks * 512 when available.
+    Returns None if the operation cannot be performed.
     """
 
-    if os.name == "nt":
+    if os.name != "nt":
+        return None
 
-        high = wintypes.DWORD(0)
+    try:
+        import ctypes
 
-        ctypes.set_last_error(ERROR_SUCCESS)
+        GetCompressedFileSizeW = (
+            ctypes.windll.kernel32
+            .GetCompressedFileSizeW
+        )
 
-        low = kernel32.GetCompressedFileSizeW(
+        GetCompressedFileSizeW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.POINTER(
+                ctypes.c_ulong
+            ),
+        ]
+
+        GetCompressedFileSizeW.restype = (
+            ctypes.c_ulong
+        )
+
+        high = ctypes.c_ulong()
+
+        low = GetCompressedFileSizeW(
             str(path),
             ctypes.byref(high),
         )
 
-        if low != INVALID_FILE_SIZE:
-            return (
-                (int(high.value) << 32)
-                | int(low)
-            )
+        invalid = 0xFFFFFFFF
 
-        error = ctypes.get_last_error()
-
-        if error == ERROR_SUCCESS:
-            return int(low)
-
-    try:
-
-        stat = path.stat()
-
-        blocks = getattr(
-            stat,
-            "st_blocks",
-            0,
-        )
-
-        if blocks:
-            return int(blocks) * 512
-
-        return int(stat.st_size)
-
-    except Exception:
-
-        return 0
-
-
-# ============================================================
-# Windows Volume Statistics
-# ============================================================
-
-def get_volume_statistics(
-    path: Path,
-) -> tuple[int, int, int]:
-    """
-    Returns:
-
-        available_to_caller
-        total_capacity
-        total_free
-    """
-
-    if os.name != "nt":
-
-        usage = shutil.disk_usage(path)
+        if (
+            low == invalid
+            and ctypes.GetLastError() != 0
+        ):
+            return None
 
         return (
-            usage.free,
-            usage.total,
-            usage.free,
-        )
-
-    available = ctypes.c_ulonglong(0)
-    capacity = ctypes.c_ulonglong(0)
-    free = ctypes.c_ulonglong(0)
-
-    success = kernel32.GetDiskFreeSpaceExW(
-        str(path),
-        ctypes.byref(available),
-        ctypes.byref(capacity),
-        ctypes.byref(free),
-    )
-
-    if not success:
-
-        error = ctypes.get_last_error()
-
-        raise OSError(
-            error,
-            f"GetDiskFreeSpaceExW failed for {path}"
-        )
-
-    return (
-        int(available.value),
-        int(capacity.value),
-        int(free.value),
-    )
-
-
-# ============================================================
-# File Information
-# ============================================================
-
-@dataclass
-class TransferFile:
-    source: str
-    relative_path: str
-    size: int
-
-
-# ============================================================
-# Folder Statistics
-# ============================================================
-
-@dataclass
-class FolderStatistics:
-
-    logical_size: int = 0
-
-    allocated_size: int = 0
-
-    file_count: int = 0
-
-    directory_count: int = 0
-
-    scan_errors: int = 0
-
-    skipped_reparse_points: int = 0
-
-    largest_file_size: int = 0
-
-    largest_file_path: str = ""
-
-    allocation_difference: int = 0
-
-
-# ============================================================
-# Reparse Point Detection
-# ============================================================
-
-def is_reparse_point(path: Path) -> bool:
-
-    try:
-
-        attributes = ctypes.windll.kernel32.GetFileAttributesW(
-            str(path)
-        )
-
-        if attributes == 0xFFFFFFFF:
-            return False
-
-        return bool(
-            attributes
-            & FILE_ATTRIBUTE_REPARSE_POINT
+            (high.value << 32)
+            + low
         )
 
     except Exception:
-
-        try:
-            return path.is_symlink()
-
-        except Exception:
-            return False
+        return None
 
 
-# ============================================================
-# Folder Statistics Scanner
-# ============================================================
-
-def scan_folder_statistics(
+def folder_size(
     root: Path,
-) -> FolderStatistics:
+) -> FolderStats:
+    """
+    Scan a directory and calculate logical file size plus
+    Windows allocated size where available.
 
-    stats = FolderStatistics()
+    Junctions and symbolic links are not followed.
+    """
 
-    if not root.exists():
-        return stats
+    stats = FolderStats()
 
-    stack = [root]
+    root = Path(root)
 
-    while stack:
+    def walk_error(error):
+        stats.errors += 1
 
-        current = stack.pop()
+        append_log(
+            f"SIZE SCAN WARNING: {error}"
+        )
 
-        try:
+    try:
 
-            with os.scandir(current) as entries:
+        for current_root, dirs, files in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+            onerror=walk_error,
+        ):
 
-                for entry in entries:
+            stats.directory_count += len(
+                dirs
+            )
 
-                    try:
+            filtered_dirs = []
 
-                        entry_path = Path(entry.path)
+            for dirname in dirs:
 
-                        if entry.is_dir(
-                            follow_symlinks=False
-                        ):
+                directory = (
+                    Path(current_root)
+                    / dirname
+                )
 
-                            if is_reparse_point(
-                                entry_path
-                            ):
+                try:
 
-                                stats.skipped_reparse_points += 1
+                    if directory.is_symlink():
+                        stats.reparse_points += 1
+                        continue
 
-                                continue
+                    filtered_dirs.append(
+                        dirname
+                    )
 
-                            stats.directory_count += 1
+                except OSError:
 
-                            stack.append(
-                                entry_path
-                            )
+                    stats.errors += 1
 
-                            continue
+            dirs[:] = filtered_dirs
 
-                        if not entry.is_file(
-                            follow_symlinks=False
-                        ):
-                            continue
+            for filename in files:
 
-                        if is_reparse_point(
-                            entry_path
-                        ):
+                file_path = (
+                    Path(current_root)
+                    / filename
+                )
 
-                            stats.skipped_reparse_points += 1
+                try:
 
-                            continue
+                    if file_path.is_symlink():
+                        stats.reparse_points += 1
+                        continue
 
-                        file_stat = entry.stat(
-                            follow_symlinks=False
+                    size = (
+                        file_path.stat().st_size
+                    )
+
+                    stats.logical_size += size
+                    stats.file_count += 1
+
+                    if (
+                        size
+                        > stats.largest_file_size
+                    ):
+                        stats.largest_file_size = size
+                        stats.largest_file_path = (
+                            str(file_path)
                         )
 
-                        logical = int(
-                            file_stat.st_size
-                        )
+                except (
+                    OSError,
+                    PermissionError,
+                ) as e:
 
-                        allocated = (
-                            get_file_size_on_disk(
-                                entry_path
-                            )
-                        )
+                    stats.errors += 1
 
-                        stats.logical_size += logical
+                    append_log(
+                        f"SIZE SCAN WARNING: "
+                        f"{file_path}: {e}"
+                    )
 
-                        stats.allocated_size += allocated
+    except Exception as e:
 
-                        stats.file_count += 1
+        stats.errors += 1
 
-                        if logical > stats.largest_file_size:
-
-                            stats.largest_file_size = logical
-
-                            stats.largest_file_path = (
-                                str(entry_path)
-                            )
-
-                    except OSError:
-
-                        stats.scan_errors += 1
-
-        except OSError:
-
-            stats.scan_errors += 1
-
-    stats.allocation_difference = (
-        stats.allocated_size
-        - stats.logical_size
-    )
+        append_log(
+            f"SIZE SCAN ERROR: "
+            f"{root}: {e}"
+        )
 
     return stats
 
 
-# ============================================================
-# Transfer File Scanner
-# ============================================================
+def filesystem_stats(
+    path: Path,
+) -> dict:
 
-def scan_transfer_files(
-    source: Path,
-) -> tuple[list[TransferFile], int]:
+    usage = shutil.disk_usage(
+        path
+    )
 
-    files: list[TransferFile] = []
-
-    errors = 0
-
-    stack = [source]
-
-    while stack:
-
-        current = stack.pop()
-
-        try:
-
-            with os.scandir(current) as entries:
-
-                for entry in entries:
-
-                    try:
-
-                        path = Path(entry.path)
-
-                        if entry.is_dir(
-                            follow_symlinks=False
-                        ):
-
-                            if is_reparse_point(path):
-                                continue
-
-                            stack.append(path)
-
-                            continue
-
-                        if not entry.is_file(
-                            follow_symlinks=False
-                        ):
-                            continue
-
-                        if is_reparse_point(path):
-                            continue
-
-                        size = int(
-                            entry.stat(
-                                follow_symlinks=False
-                            ).st_size
-                        )
-
-                        relative = os.path.relpath(
-                            path,
-                            source,
-                        )
-
-                        files.append(
-                            TransferFile(
-                                source=str(path),
-                                relative_path=relative,
-                                size=size,
-                            )
-                        )
-
-                    except OSError:
-
-                        errors += 1
-
-        except OSError:
-
-            errors += 1
-
-    return files, errors
-
-
-# ============================================================
-# Manifest
-# ============================================================
-
-def save_manifest(
-    files: list[TransferFile],
-    order_name: str,
-) -> None:
-
-    with TRANSFER_MANIFEST.open(
-        "w",
-        encoding="utf-8",
-    ) as handle:
-
-        handle.write(
-            "# Safe Transfer file manifest\n"
-        )
-
-        handle.write(
-            f"# Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
-
-        handle.write(
-            f"# Order: {order_name}\n"
-        )
-
-        handle.write(
-            f"# Files: {len(files):,}\n"
-        )
-
-        handle.write(
-            "# Format: SIZE_BYTES<TAB>RELATIVE_PATH\n"
-        )
-
-        handle.write("\n")
-
-        for item in files:
-
-            handle.write(
-                f"{item.size}\t{item.relative_path}\n"
-            )
-
-
-# ============================================================
-# Pause / Resume State
-# ============================================================
-
-def save_pause_state(
-    source: str,
-    destination: str,
-    current_index: int,
-    files: list[TransferFile],
-) -> None:
-
-    state = {
-        "source": source,
-        "destination": destination,
-        "current_index": current_index,
-        "files": [
-            {
-                "source": item.source,
-                "relative_path": item.relative_path,
-                "size": item.size,
-            }
-            for item in files
-        ],
+    return {
+        "capacity": usage.total,
+        "free": usage.free,
+        "used": (
+            usage.total
+            - usage.free
+        ),
+        "available": usage.free,
     }
 
-    try:
 
-        with STATE_FILE.open(
-            "w",
-            encoding="utf-8",
-        ) as handle:
+# ======================================================================
+# STATE MANAGEMENT
+# ======================================================================
 
-            json.dump(
-                state,
-                handle,
-                indent=2,
-            )
-
-    except Exception as exc:
-
-        write_log(
-            f"Failed saving pause state: {exc}"
-        )
-
-
-def load_pause_state() -> Optional[dict]:
+def load_state() -> dict | None:
 
     if not STATE_FILE.exists():
         return None
@@ -650,42 +459,394 @@ def load_pause_state() -> Optional[dict]:
         with STATE_FILE.open(
             "r",
             encoding="utf-8",
-        ) as handle:
+        ) as f:
+            return json.load(f)
 
-            return json.load(handle)
-
-    except Exception as exc:
-
-        write_log(
-            f"Failed loading pause state: {exc}"
-        )
+    except Exception:
 
         return None
 
 
-def clear_pause_state() -> None:
+def save_state(data: dict):
+
+    temp_file = (
+        STATE_FILE.with_suffix(
+            ".tmp"
+        )
+    )
+
+    try:
+
+        with temp_file.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                data,
+                f,
+                indent=4,
+            )
+
+        temp_file.replace(
+            STATE_FILE
+        )
+
+    except Exception as e:
+
+        append_log(
+            f"STATE SAVE ERROR: {e}"
+        )
+
+
+def delete_state():
 
     try:
 
         if STATE_FILE.exists():
             STATE_FILE.unlink()
 
-    except Exception as exc:
+    except Exception as e:
 
-        write_log(
-            f"Failed clearing pause state: {exc}"
+        append_log(
+            f"STATE DELETE ERROR: {e}"
         )
 
 
-# ============================================================
-# Statistics Worker
-# ============================================================
+# ======================================================================
+# FILE SIZE LIST
+# ======================================================================
 
-class FolderStatsWorker(QObject):
+def save_file_size_list(
+    files: list,
+    source: Path,
+    sort_mode: str,
+):
 
-    finished = pyqtSignal(
+    try:
+
+        with SIZE_LIST_FILE.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(
+                "Safe Transfer - File Size List\n"
+            )
+
+            f.write(
+                "================================\n\n"
+            )
+
+            f.write(
+                f"Source: {source}\n"
+            )
+
+            f.write(
+                f"Generated: "
+                f"{datetime.now().astimezone()}\n"
+            )
+
+            f.write(
+                f"Sort order: {sort_mode}\n"
+            )
+
+            f.write(
+                f"Files: {len(files):,}\n\n"
+            )
+
+            f.write(
+                "SIZE_BYTES\tSIZE\tPATH\n"
+            )
+
+            f.write(
+                "----------------------------------------\n"
+            )
+
+            for path, size in files:
+
+                try:
+                    relative = path.relative_to(
+                        source
+                    )
+
+                except ValueError:
+                    relative = path.name
+
+                f.write(
+                    f"{size}\t"
+                    f"{human_bytes(size)}\t"
+                    f"{relative}\n"
+                )
+
+    except Exception as e:
+
+        append_log(
+            f"SIZE LIST SAVE ERROR: {e}"
+        )
+
+
+# ======================================================================
+# FOLDER STATS WORKER
+# ======================================================================
+
+class FolderStatsWorker(QThread):
+
+    result = pyqtSignal(
         object,
         object,
+    )
+
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source_path,
+        destination_path,
+    ):
+
+        super().__init__()
+
+        self.source_path = source_path
+        self.destination_path = (
+            destination_path
+        )
+
+    def run(self):
+
+        try:
+
+            source_stats = None
+
+            destination_stats = None
+
+            if (
+                self.source_path
+                and self.source_path.exists()
+                and self.source_path.is_dir()
+            ):
+
+                source_stats = folder_size(
+                    self.source_path
+                )
+
+            if self.destination_path:
+
+                destination_stats = (
+                    filesystem_stats(
+                        self.destination_path
+                    )
+                )
+
+            self.result.emit(
+                source_stats,
+                destination_stats,
+            )
+
+        except Exception as e:
+
+            self.error.emit(
+                str(e)
+            )
+
+
+# ======================================================================
+# SOURCE FILE SCANNER
+# ======================================================================
+
+class FileScanner(QThread):
+
+    progress = pyqtSignal(int)
+
+    status = pyqtSignal(str)
+
+    result = pyqtSignal(
+        list,
+        int,
+        int,
+    )
+
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        source: Path,
+        sort_mode: str,
+    ):
+
+        super().__init__()
+
+        self.source = source
+        self.sort_mode = sort_mode
+
+    def run(self):
+
+        try:
+
+            files = []
+
+            inaccessible = 0
+
+            count = 0
+
+            self.status.emit(
+                "Scanning source directory..."
+            )
+
+            last_update = (
+                time.monotonic()
+            )
+
+            def walk_error(error):
+
+                nonlocal inaccessible
+
+                inaccessible += 1
+
+                append_log(
+                    f"FILE SCAN WARNING: "
+                    f"{error}"
+                )
+
+            for current_root, dirs, filenames in os.walk(
+                self.source,
+                topdown=True,
+                followlinks=False,
+                onerror=walk_error,
+            ):
+
+                filtered_dirs = []
+
+                for dirname in dirs:
+
+                    directory = (
+                        Path(current_root)
+                        / dirname
+                    )
+
+                    try:
+
+                        if directory.is_symlink():
+                            continue
+
+                        filtered_dirs.append(
+                            dirname
+                        )
+
+                    except OSError:
+
+                        inaccessible += 1
+
+                dirs[:] = filtered_dirs
+
+                for filename in filenames:
+
+                    path = (
+                        Path(current_root)
+                        / filename
+                    )
+
+                    count += 1
+
+                    try:
+
+                        if path.is_symlink():
+                            continue
+
+                        size = (
+                            path.stat().st_size
+                        )
+
+                        files.append(
+                            (
+                                path,
+                                size,
+                            )
+                        )
+
+                    except (
+                        OSError,
+                        PermissionError,
+                    ) as e:
+
+                        inaccessible += 1
+
+                        append_log(
+                            f"FILE SCAN WARNING: "
+                            f"{path}: {e}"
+                        )
+
+                    now = time.monotonic()
+
+                    if (
+                        now - last_update
+                        > 0.10
+                    ):
+
+                        self.status.emit(
+                            "Scanning source "
+                            f"directory... "
+                            f"({count:,} files found)"
+                        )
+
+                        last_update = now
+
+            total = len(files)
+
+            self.status.emit(
+                f"Sorting {total:,} files..."
+            )
+
+            if self.sort_mode == "Largest → Smallest":
+
+                files.sort(
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+
+            else:
+
+                files.sort(
+                    key=lambda item: item[1]
+                )
+
+            save_file_size_list(
+                files,
+                self.source,
+                self.sort_mode,
+            )
+
+            self.progress.emit(
+                100
+            )
+
+            self.result.emit(
+                files,
+                total,
+                inaccessible,
+            )
+
+        except Exception as e:
+
+            self.error.emit(
+                f"Source scan failed:\n\n{e}"
+            )
+
+
+# ======================================================================
+# MISSING FILE SCANNER
+# ======================================================================
+
+class MissingFilesScanner(QThread):
+
+    progress = pyqtSignal(int)
+
+    status = pyqtSignal(str)
+
+    result = pyqtSignal(
+        list,
+        int,
+        int,
     )
 
     error = pyqtSignal(str)
@@ -699,87 +860,220 @@ class FolderStatsWorker(QObject):
         super().__init__()
 
         self.source = source
-
         self.destination = destination
 
-    @pyqtSlot()
     def run(self):
 
         try:
 
-            write_log(
-                f"Scanning source statistics: {self.source}"
+            all_files = []
+
+            inaccessible = 0
+
+            self.status.emit(
+                "Indexing source directory..."
             )
 
-            source_stats = scan_folder_statistics(
-                self.source
+            last_update = (
+                time.monotonic()
             )
 
-            write_log(
-                "FOLDER STATISTICS: "
-                f"Logical={source_stats.logical_size:,} "
-                f"OnDisk={source_stats.allocated_size:,} "
-                f"Files={source_stats.file_count:,} "
-                f"Directories={source_stats.directory_count:,} "
-                f"Errors={source_stats.scan_errors:,} "
-                f"ReparseSkipped={source_stats.skipped_reparse_points:,}"
+            def walk_error(error):
+
+                nonlocal inaccessible
+
+                inaccessible += 1
+
+                append_log(
+                    f"MISSING SCAN WARNING: "
+                    f"{error}"
+                )
+
+            for current_root, dirs, filenames in os.walk(
+                self.source,
+                topdown=True,
+                followlinks=False,
+                onerror=walk_error,
+            ):
+
+                filtered_dirs = []
+
+                for dirname in dirs:
+
+                    directory = (
+                        Path(current_root)
+                        / dirname
+                    )
+
+                    try:
+
+                        if directory.is_symlink():
+                            continue
+
+                        filtered_dirs.append(
+                            dirname
+                        )
+
+                    except OSError:
+
+                        inaccessible += 1
+
+                dirs[:] = filtered_dirs
+
+                for filename in filenames:
+
+                    src = (
+                        Path(current_root)
+                        / filename
+                    )
+
+                    try:
+
+                        if src.is_symlink():
+                            continue
+
+                        relative = src.relative_to(
+                            self.source
+                        )
+
+                        all_files.append(
+                            (
+                                src,
+                                relative,
+                            )
+                        )
+
+                    except (
+                        OSError,
+                        PermissionError,
+                        ValueError,
+                    ) as e:
+
+                        inaccessible += 1
+
+                        append_log(
+                            f"MISSING SCAN WARNING: "
+                            f"{src}: {e}"
+                        )
+
+                    now = time.monotonic()
+
+                    if (
+                        now - last_update
+                        > 0.10
+                    ):
+
+                        self.status.emit(
+                            "Scanning source... "
+                            f"({len(all_files):,} "
+                            "items indexed)"
+                        )
+
+                        last_update = now
+
+            total = len(all_files)
+
+            missing = []
+
+            if total == 0:
+
+                self.result.emit(
+                    [],
+                    0,
+                    inaccessible,
+                )
+
+                return
+
+            last_update = (
+                time.monotonic()
             )
 
-            (
-                available,
-                capacity,
-                free,
-            ) = get_volume_statistics(
-                self.destination
+            for index, (
+                src,
+                relative,
+            ) in enumerate(
+                all_files,
+                start=1,
+            ):
+
+                try:
+
+                    destination_file = (
+                        self.destination
+                        / relative
+                    )
+
+                    if not destination_file.is_file():
+
+                        missing.append(
+                            relative
+                        )
+
+                except (
+                    OSError,
+                    PermissionError,
+                ) as e:
+
+                    inaccessible += 1
+
+                    append_log(
+                        f"MISSING CHECK WARNING: "
+                        f"{relative}: {e}"
+                    )
+
+                now = time.monotonic()
+
+                if (
+                    now - last_update
+                    > 0.05
+                    or index == total
+                ):
+
+                    self.status.emit(
+                        f"Checking "
+                        f"{index:,}/{total:,}: "
+                        f"{relative}"
+                    )
+
+                    self.progress.emit(
+                        int(
+                            index
+                            / total
+                            * 100
+                        )
+                    )
+
+                    last_update = now
+
+            self.result.emit(
+                missing,
+                total,
+                inaccessible,
             )
 
-            destination_stats = {
-                "available": available,
-                "capacity": capacity,
-                "free": free,
-            }
-
-            write_log(
-                "DESTINATION VOLUME: "
-                f"Capacity={capacity:,} "
-                f"Free={free:,} "
-                f"Available={available:,}"
-            )
-
-            self.finished.emit(
-                source_stats,
-                destination_stats,
-            )
-
-        except Exception as exc:
-
-            write_log(
-                f"Statistics scan failed: {exc}"
-            )
+        except Exception as e:
 
             self.error.emit(
-                f"{type(exc).__name__}: {exc}"
+                f"Missing-file scan failed:\n\n{e}"
             )
 
 
-# ============================================================
-# Transfer Worker
-# ============================================================
+# ======================================================================
+# TRANSFER WORKER
+# ======================================================================
 
-class TransferWorker(QObject):
+class TransferWorker(QThread):
 
-    progress = pyqtSignal(
-        int,
-        int,
-        int,
-        str,
-    )
+    progress = pyqtSignal(int)
 
     status = pyqtSignal(str)
 
-    finished = pyqtSignal()
+    statistics = pyqtSignal(str)
 
-    paused = pyqtSignal()
+    log = pyqtSignal(str)
+
+    finished_result = pyqtSignal(dict)
 
     error = pyqtSignal(str)
 
@@ -787,430 +1081,702 @@ class TransferWorker(QObject):
         self,
         source: Path,
         destination: Path,
-        files: list[TransferFile],
-        move_files: bool,
+        files: list,
+        move: bool,
         skip_existing: bool,
-        verify: bool,
+        ignore_space: bool,
+        verify_files: bool,
+        shutdown_on_complete: bool,
         start_index: int = 0,
     ):
 
         super().__init__()
 
         self.source = source
-
         self.destination = destination
 
         self.files = files
 
-        self.move_files = move_files
+        self.move = move
 
-        self.skip_existing = skip_existing
+        self.skip_existing = (
+            skip_existing
+        )
 
-        self.verify = verify
+        self.ignore_space = (
+            ignore_space
+        )
+
+        self.verify_files = (
+            verify_files
+        )
+
+        self.shutdown_on_complete = (
+            shutdown_on_complete
+        )
 
         self.start_index = start_index
 
         self.pause_requested = False
+        self.stop_requested = False
 
-        self.cancel_requested = False
+        self.started = time.monotonic()
+
+        self.bytes_copied = 0
+
+        self.total_bytes = sum(
+            size
+            for _, size
+            in files[
+                start_index:
+            ]
+        )
+
+        self.files_copied = 0
+
+        self.files_skipped = 0
+
+        self.failed = []
+
+        self.successful_source_files = []
 
     def request_pause(self):
-
         self.pause_requested = True
 
-    def request_cancel(self):
+    def request_stop(self):
+        self.stop_requested = True
 
-        self.cancel_requested = True
+    def calculate_required_space(self):
 
-    def check_pause(
-        self,
-        index: int,
-    ):
+        required = 0
 
-        if self.cancel_requested:
+        for src_file, size in self.files[
+            self.start_index:
+        ]:
 
-            raise RuntimeError(
-                "Transfer cancelled."
+            try:
+
+                relative = (
+                    src_file.relative_to(
+                        self.source
+                    )
+                )
+
+            except ValueError:
+
+                relative = Path(
+                    src_file.name
+                )
+
+            dst_file = (
+                self.destination
+                / relative
             )
 
-        if self.pause_requested:
+            if (
+                self.skip_existing
+                and dst_file.is_file()
+            ):
 
-            save_pause_state(
-                str(self.source),
-                str(self.destination),
-                index,
-                self.files,
-            )
+                try:
 
-            raise RuntimeError(
-                "Transfer paused."
-            )
+                    if (
+                        dst_file.stat()
+                        .st_size
+                        == size
+                    ):
+                        continue
+
+                except (
+                    OSError,
+                    PermissionError,
+                ):
+                    pass
+
+            required += size
+
+        return required
 
     def create_folder_structure(self):
 
-        self.status.emit(
-            "Creating destination folder structure..."
-        )
+        directories = set()
 
-        write_log(
-            "Creating destination folder structure."
-        )
+        for src_file, _ in self.files:
 
-        directories: set[Path] = set()
+            try:
 
-        for item in self.files:
-
-            relative = Path(
-                item.relative_path
-            )
-
-            parent = relative.parent
-
-            if str(parent) not in ("", "."):
-
-                directories.add(
-                    self.destination / parent
+                relative = (
+                    src_file.relative_to(
+                        self.source
+                    )
                 )
+
+                parent = (
+                    relative.parent
+                )
+
+                if str(parent) != ".":
+
+                    directories.add(
+                        parent
+                    )
+
+            except ValueError:
+
+                continue
 
         directories = sorted(
             directories,
-            key=lambda p: len(p.parts),
+            key=lambda p: (
+                len(p.parts),
+                str(p).lower(),
+            )
         )
 
-        for directory in directories:
+        for relative_dir in directories:
 
-            if self.cancel_requested:
+            if self.stop_requested:
+                return
 
-                raise RuntimeError(
-                    "Transfer cancelled."
+            destination_dir = (
+                self.destination
+                / relative_dir
+            )
+
+            try:
+
+                destination_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
                 )
 
-            directory.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            except Exception as e:
 
-    def copy_file(
-        self,
-        source: Path,
-        destination: Path,
-    ):
-
-        destination.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        with source.open(
-            "rb"
-        ) as src:
-
-            with destination.open(
-                "wb"
-            ) as dst:
-
-                while True:
-
-                    if self.cancel_requested:
-
-                        raise RuntimeError(
-                            "Transfer cancelled."
-                        )
-
-                    if self.pause_requested:
-
-                        raise RuntimeError(
-                            "Transfer paused."
-                        )
-
-                    data = src.read(
-                        BUFFER_SIZE
-                    )
-
-                    if not data:
-                        break
-
-                    dst.write(data)
-
-        try:
-
-            shutil.copystat(
-                source,
-                destination,
-            )
-
-        except Exception:
-
-            pass
-
-    def verify_file(
-        self,
-        source: Path,
-        destination: Path,
-    ) -> bool:
-
-        try:
-
-            source_size = source.stat().st_size
-
-            destination_size = (
-                destination.stat().st_size
-            )
-
-            return (
-                source_size
-                == destination_size
-            )
-
-        except Exception:
-
-            return False
+                self.log.emit(
+                    f"WARNING - could not create "
+                    f"directory {relative_dir}: {e}"
+                )
 
     def run(self):
 
-        try:
+        total_files = len(
+            self.files
+        )
 
-            if not self.files:
+        if total_files == 0:
 
-                self.finished.emit()
+            self.finished_result.emit(
+                {
+                    "success": True,
+                    "paused": False,
+                    "copied": 0,
+                    "skipped": 0,
+                    "failed": [],
+                    "bytes": 0,
+                    "index": 0,
+                    "successful_source_files": [],
+                }
+            )
+
+            return
+
+        state = {
+            "Source": str(
+                self.source
+            ),
+            "Destination": str(
+                self.destination
+            ),
+            "Move": self.move,
+            "SkipExisting": (
+                self.skip_existing
+            ),
+            "IgnoreSpace": (
+                self.ignore_space
+            ),
+            "VerifyFiles": (
+                self.verify_files
+            ),
+            "ShutdownOnComplete": (
+                self.shutdown_on_complete
+            ),
+            "Index": self.start_index,
+            "Paused": False,
+        }
+
+        # --------------------------------------------------------------
+        # FREE SPACE CHECK
+        # --------------------------------------------------------------
+
+        if not self.ignore_space:
+
+            try:
+
+                required = (
+                    self.calculate_required_space()
+                )
+
+                available = free_space(
+                    self.destination
+                )
+
+                if required > available:
+
+                    message = (
+                        "Insufficient free space.\n\n"
+                        f"Needed: "
+                        f"{human_bytes(required)}\n"
+                        f"Available: "
+                        f"{human_bytes(available)}"
+                    )
+
+                    self.log.emit(
+                        "FAILED - insufficient "
+                        "free space."
+                    )
+
+                    self.finished_result.emit(
+                        {
+                            "success": False,
+                            "paused": False,
+                            "copied": 0,
+                            "skipped": 0,
+                            "failed": [],
+                            "bytes": 0,
+                            "message": message,
+                            "index": self.start_index,
+                            "successful_source_files": [],
+                        }
+                    )
+
+                    return
+
+            except Exception as e:
+
+                self.error.emit(
+                    "Could not determine "
+                    "destination free space:\n\n"
+                    f"{e}"
+                )
 
                 return
 
-            # ------------------------------------------------
-            # STEP 1:
-            # Create ALL folders first.
-            # ------------------------------------------------
+        # --------------------------------------------------------------
+        # CREATE EMPTY FOLDER STRUCTURE
+        # --------------------------------------------------------------
 
-            self.create_folder_structure()
+        self.status.emit(
+            "Creating destination "
+            "folder structure..."
+        )
 
-            total_bytes = sum(
-                item.size
-                for item in self.files
+        self.create_folder_structure()
+
+        # --------------------------------------------------------------
+        # TRANSFER
+        # --------------------------------------------------------------
+
+        last_status_update = 0.0
+
+        for index in range(
+            self.start_index,
+            total_files,
+        ):
+
+            if self.stop_requested:
+                break
+
+            src_file, size = (
+                self.files[index]
             )
 
-            transferred_bytes = sum(
-                item.size
-                for item in self.files[
-                    :self.start_index
-                ]
+            try:
+
+                relative = (
+                    src_file.relative_to(
+                        self.source
+                    )
+                )
+
+            except ValueError:
+
+                relative = Path(
+                    src_file.name
+                )
+
+            dst_file = (
+                self.destination
+                / relative
             )
 
-            total_files = len(self.files)
+            now = time.monotonic()
 
-            # ------------------------------------------------
-            # STEP 2:
-            # Transfer files in selected order.
-            # ------------------------------------------------
-
-            for index in range(
-                self.start_index,
-                total_files,
+            if (
+                now - last_status_update
+                > 0.05
+                or index
+                == total_files - 1
             ):
-
-                self.check_pause(index)
-
-                item = self.files[index]
-
-                source = Path(
-                    item.source
-                )
-
-                destination = (
-                    self.destination
-                    / Path(item.relative_path)
-                )
 
                 self.status.emit(
                     f"{index + 1:,} / "
-                    f"{total_files:,}: "
-                    f"{item.relative_path}"
+                    f"{total_files:,}    "
+                    f"{relative}"
                 )
 
-                if not source.exists():
+                last_status_update = now
 
-                    write_log(
-                        f"Source missing: {source}"
-                    )
+            # ----------------------------------------------------------
+            # SKIP EXISTING
+            # ----------------------------------------------------------
 
-                    transferred_bytes += item.size
+            if (
+                self.skip_existing
+                and dst_file.is_file()
+            ):
 
-                    self.progress.emit(
-                        transferred_bytes,
-                        total_bytes,
-                        index + 1,
-                        item.relative_path,
-                    )
-
-                    continue
-
-                # --------------------------------------------
-                # Skip existing files
-                # --------------------------------------------
-
-                if (
-                    self.skip_existing
-                    and destination.exists()
-                ):
-
-                    try:
-
-                        destination_size = (
-                            destination.stat().st_size
-                        )
-
-                    except OSError:
-
-                        destination_size = -1
+                try:
 
                     if (
-                        destination_size
-                        == item.size
+                        dst_file.stat()
+                        .st_size
+                        == size
                     ):
 
-                        write_log(
-                            f"Skipped existing: "
-                            f"{destination}"
+                        self.files_skipped += 1
+
+                        self.successful_source_files.append(
+                            src_file
                         )
 
-                        transferred_bytes += (
-                            item.size
+                        self.log.emit(
+                            f"SKIPPED - "
+                            f"{relative} "
+                            f"(same size)"
                         )
 
-                        self.progress.emit(
-                            transferred_bytes,
-                            total_bytes,
+                        self.update_statistics(
                             index + 1,
-                            item.relative_path,
+                            total_files,
                         )
+
+                        if self.pause_requested:
+
+                            state["Paused"] = True
+
+                            state["Index"] = (
+                                index + 1
+                            )
+
+                            save_state(
+                                state
+                            )
+
+                            self.finished_result.emit(
+                                {
+                                    "success": False,
+                                    "paused": True,
+                                    "copied": self.files_copied,
+                                    "skipped": self.files_skipped,
+                                    "failed": self.failed,
+                                    "bytes": self.bytes_copied,
+                                    "index": index + 1,
+                                    "successful_source_files":
+                                        self.successful_source_files,
+                                }
+                            )
+
+                            return
 
                         continue
 
-                # --------------------------------------------
-                # Transfer
-                # --------------------------------------------
+                except Exception as e:
 
-                write_log(
-                    f"{'MOVE' if self.move_files else 'COPY'}: "
-                    f"{source} -> {destination} "
-                    f"({item.size:,} bytes)"
-                )
-
-                self.copy_file(
-                    source,
-                    destination,
-                )
-
-                # --------------------------------------------
-                # Verification
-                # --------------------------------------------
-
-                if self.verify:
-
-                    if not self.verify_file(
-                        source,
-                        destination,
-                    ):
-
-                        raise RuntimeError(
-                            "Verification failed for "
-                            f"{item.relative_path}"
-                        )
-
-                # --------------------------------------------
-                # Move removes source AFTER successful copy
-                # --------------------------------------------
-
-                if self.move_files:
-
-                    try:
-
-                        source.unlink()
-
-                        write_log(
-                            f"Deleted source after move: "
-                            f"{source}"
-                        )
-
-                    except Exception as exc:
-
-                        raise RuntimeError(
-                            "Copied file successfully, "
-                            "but could not remove source: "
-                            f"{source} ({exc})"
-                        )
-
-                transferred_bytes += item.size
-
-                elapsed_start = time.monotonic()
-
-                percent = 0
-
-                if total_bytes > 0:
-
-                    percent = int(
-                        (
-                            transferred_bytes
-                            / total_bytes
-                        )
-                        * 100
+                    self.log.emit(
+                        f"WARNING - inspect "
+                        f"error {relative}: {e}"
                     )
 
-                self.progress.emit(
-                    transferred_bytes,
-                    total_bytes,
+            # ----------------------------------------------------------
+            # CREATE PARENT DIRECTORY
+            # ----------------------------------------------------------
+
+            try:
+
+                dst_file.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+            except Exception as e:
+
+                self.failed.append(
+                    (
+                        str(relative),
+                        str(e),
+                    )
+                )
+
+                self.log.emit(
+                    f"FAILED - mkdir - "
+                    f"{relative}: {e}"
+                )
+
+                self.update_statistics(
                     index + 1,
-                    item.relative_path,
+                    total_files,
                 )
 
-            # ------------------------------------------------
-            # Done
-            # ------------------------------------------------
+                continue
 
-            clear_pause_state()
+            # ----------------------------------------------------------
+            # COPY
+            # ----------------------------------------------------------
 
-            self.status.emit(
-                "Transfer complete."
-            )
+            try:
 
-            write_log(
-                "Transfer completed successfully."
-            )
-
-            self.finished.emit()
-
-        except Exception as exc:
-
-            error_text = (
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            write_log(
-                f"Transfer stopped: {error_text}"
-            )
-
-            if "Transfer paused." in str(exc):
-
-                self.paused.emit()
-
-            else:
-
-                self.error.emit(
-                    error_text
+                shutil.copy2(
+                    src_file,
+                    dst_file,
                 )
 
+                if self.verify_files:
 
-# ============================================================
-# Main Window
-# ============================================================
+                    destination_size = (
+                        dst_file.stat()
+                        .st_size
+                    )
 
-class MainWindow(QMainWindow):
+                    if (
+                        destination_size
+                        != size
+                    ):
+
+                        raise IOError(
+                            "Size mismatch "
+                            "after copy. "
+                            f"Expected "
+                            f"{size} bytes, "
+                            f"got "
+                            f"{destination_size} "
+                            "bytes."
+                        )
+
+                self.bytes_copied += size
+
+                self.files_copied += 1
+
+                self.successful_source_files.append(
+                    src_file
+                )
+
+                operation = (
+                    "COPIED FOR MOVE"
+                    if self.move
+                    else "COPIED"
+                )
+
+                self.log.emit(
+                    f"{operation} - "
+                    f"{relative} "
+                    f"({human_bytes(size)})"
+                )
+
+            except Exception as e:
+
+                self.failed.append(
+                    (
+                        str(relative),
+                        str(e),
+                    )
+                )
+
+                self.log.emit(
+                    f"FAILED - "
+                    f"{relative}: {e}"
+                )
+
+            # ----------------------------------------------------------
+            # SAVE STATE
+            # ----------------------------------------------------------
+
+            if (
+                index % 50 == 0
+                or index
+                == total_files - 1
+            ):
+
+                state["Index"] = (
+                    index + 1
+                )
+
+                save_state(
+                    state
+                )
+
+            self.update_statistics(
+                index + 1,
+                total_files,
+            )
+
+            # ----------------------------------------------------------
+            # PAUSE
+            # ----------------------------------------------------------
+
+            if self.pause_requested:
+
+                state["Paused"] = True
+
+                state["Index"] = (
+                    index + 1
+                )
+
+                save_state(
+                    state
+                )
+
+                self.log.emit(
+                    f"PAUSED at file "
+                    f"{index + 1:,}."
+                )
+
+                self.finished_result.emit(
+                    {
+                        "success": False,
+                        "paused": True,
+                        "copied": self.files_copied,
+                        "skipped": self.files_skipped,
+                        "failed": self.failed,
+                        "bytes": self.bytes_copied,
+                        "index": index + 1,
+                        "successful_source_files":
+                            self.successful_source_files,
+                    }
+                )
+
+                return
+
+        # --------------------------------------------------------------
+        # FINISHED
+        # --------------------------------------------------------------
+
+        success = (
+            len(self.failed) == 0
+            and not self.stop_requested
+        )
+
+        self.finished_result.emit(
+            {
+                "success": success,
+                "paused": False,
+                "copied": self.files_copied,
+                "skipped": self.files_skipped,
+                "failed": self.failed,
+                "bytes": self.bytes_copied,
+                "index": total_files,
+                "successful_source_files":
+                    self.successful_source_files,
+                "shutdown_on_complete":
+                    self.shutdown_on_complete,
+            }
+        )
+
+    def update_statistics(
+        self,
+        completed,
+        total,
+    ):
+
+        elapsed = (
+            time.monotonic()
+            - self.started
+        )
+
+        speed = (
+            self.bytes_copied
+            / elapsed
+            if elapsed > 0
+            else 0
+        )
+
+        remaining_bytes = max(
+            0,
+            self.total_bytes
+            - self.bytes_copied,
+        )
+
+        if (
+            speed > 0
+            and remaining_bytes > 0
+        ):
+
+            eta = (
+                remaining_bytes
+                / speed
+            )
+
+        else:
+
+            eta = 0
+
+        percent = int(
+            completed
+            / total
+            * 100
+        )
+
+        self.progress.emit(
+            percent
+        )
+
+        if speed > 0:
+
+            eta_text = format_seconds(
+                eta
+            )
+
+            completion_text = (
+                format_completion_time(
+                    eta
+                )
+            )
+
+        else:
+
+            eta_text = "—"
+
+            completion_text = "—"
+
+        self.statistics.emit(
+            f"Files: "
+            f"{completed:,}/{total:,}"
+            f"    |    "
+            f"Transferred: "
+            f"{human_bytes(self.bytes_copied)}"
+            f" / "
+            f"{human_bytes(self.total_bytes)}"
+            f"    |    "
+            f"Speed: "
+            f"{human_bytes(speed)}/s"
+            f"    |    "
+            f"ETA: {eta_text}"
+            f"    |    "
+            f"Done: {completion_text}"
+        )
+
+
+# ======================================================================
+# MAIN GUI
+# ======================================================================
+
+class FileManagerGUI(QWidget):
 
     def __init__(self):
 
         super().__init__()
 
         self.setWindowTitle(
-            "Safe Transfer - Windows File Copy / Move Assistant"
+            "Windows File Copy / Move Assistant"
         )
 
         self.resize(
@@ -1218,450 +1784,443 @@ class MainWindow(QMainWindow):
             850,
         )
 
-        self.stats_thread: Optional[QThread] = None
+        self.worker = None
+        self.scan_worker = None
+        self.stats_worker = None
 
-        self.stats_worker: Optional[
-            FolderStatsWorker
-        ] = None
+        self.source = None
+        self.destination = None
 
-        self.transfer_thread: Optional[
-            QThread
-        ] = None
+        self.file_list = []
+        self.missing_files = []
 
-        self.transfer_worker: Optional[
-            TransferWorker
-        ] = None
+        self.current_operation = None
 
-        self.current_files: list[
-            TransferFile
-        ] = []
-
-        self.transfer_start_time = 0.0
-
-        self.build_ui()
-
-    # ========================================================
-    # UI
-    # ========================================================
-
-    def build_ui(self):
-
-        central = QWidget()
-
-        self.setCentralWidget(
-            central
-        )
-
-        layout = QVBoxLayout(
-            central
-        )
-
-        # ----------------------------------------------------
-        # Source / Destination
-        # ----------------------------------------------------
-
-        paths_group = QGroupBox(
-            "Source / Destination"
-        )
-
-        paths_layout = QGridLayout(
-            paths_group
-        )
+        # --------------------------------------------------------------
+        # SOURCE
+        # --------------------------------------------------------------
 
         self.source_edit = QLineEdit()
 
+        self.source_edit.setPlaceholderText(
+            "Source folder..."
+        )
+
+        self.source_button = QPushButton(
+            "Browse..."
+        )
+
+        self.source_button.clicked.connect(
+            self.browse_source
+        )
+
+        source_layout = QHBoxLayout()
+
+        source_layout.addWidget(
+            QLabel("Source:")
+        )
+
+        source_layout.addWidget(
+            self.source_edit
+        )
+
+        source_layout.addWidget(
+            self.source_button
+        )
+
+        # --------------------------------------------------------------
+        # DESTINATION
+        # --------------------------------------------------------------
+
         self.destination_edit = QLineEdit()
 
-        source_button = QPushButton(
+        self.destination_edit.setPlaceholderText(
+            "Destination folder..."
+        )
+
+        self.destination_button = QPushButton(
             "Browse..."
         )
 
-        destination_button = QPushButton(
-            "Browse..."
+        self.destination_button.clicked.connect(
+            self.browse_destination
         )
 
-        source_button.clicked.connect(
-            self.choose_source
+        destination_layout = QHBoxLayout()
+
+        destination_layout.addWidget(
+            QLabel("Destination:")
         )
 
-        destination_button.clicked.connect(
-            self.choose_destination
+        destination_layout.addWidget(
+            self.destination_edit
         )
 
-        paths_layout.addWidget(
-            QLabel("Source:"),
-            0,
-            0,
+        destination_layout.addWidget(
+            self.destination_button
         )
 
-        paths_layout.addWidget(
-            self.source_edit,
-            0,
-            1,
+        # --------------------------------------------------------------
+        # STATISTICS BUTTON
+        # --------------------------------------------------------------
+
+        self.scan_stats_button = QPushButton(
+            "Scan Source and Destination Size"
         )
 
-        paths_layout.addWidget(
-            source_button,
-            0,
-            2,
+        self.scan_stats_button.clicked.connect(
+            self.manual_folder_statistics
         )
 
-        paths_layout.addWidget(
-            QLabel("Destination:"),
-            1,
-            0,
+        # --------------------------------------------------------------
+        # OPERATION
+        # --------------------------------------------------------------
+
+        operation_group = QGroupBox(
+            "Operation"
         )
 
-        paths_layout.addWidget(
-            self.destination_edit,
-            1,
-            1,
+        operation_layout = QHBoxLayout()
+
+        self.operation_combo = QComboBox()
+
+        self.operation_combo.addItems(
+            [
+                "Copy",
+                "Move",
+            ]
         )
 
-        paths_layout.addWidget(
-            destination_button,
-            1,
-            2,
+        operation_layout.addWidget(
+            QLabel("Mode:")
         )
 
-        layout.addWidget(
-            paths_group
+        operation_layout.addWidget(
+            self.operation_combo
         )
 
-        # ----------------------------------------------------
-        # Transfer Mode
-        # ----------------------------------------------------
+        operation_layout.addStretch()
+
+        operation_group.setLayout(
+            operation_layout
+        )
+
+        # --------------------------------------------------------------
+        # SORT ORDER
+        # --------------------------------------------------------------
+
+        sort_group = QGroupBox(
+            "Transfer Order"
+        )
+
+        sort_layout = QHBoxLayout()
+
+        self.sort_combo = QComboBox()
+
+        self.sort_combo.addItems(
+            [
+                "Largest → Smallest",
+                "Smallest → Largest",
+            ]
+        )
+
+        sort_layout.addWidget(
+            QLabel("File order:")
+        )
+
+        sort_layout.addWidget(
+            self.sort_combo
+        )
+
+        sort_layout.addWidget(
+            QLabel(
+                "File sizes are saved to "
+                f"{SIZE_LIST_FILE.name}"
+            )
+        )
+
+        sort_layout.addStretch()
+
+        sort_group.setLayout(
+            sort_layout
+        )
+
+        # --------------------------------------------------------------
+        # OPTIONS
+        # --------------------------------------------------------------
 
         options_group = QGroupBox(
-            "Transfer Options"
+            "Options"
         )
 
-        options_layout = QGridLayout(
-            options_group
+        options_layout = QVBoxLayout()
+
+        row1 = QHBoxLayout()
+
+        self.skip_existing = QCheckBox(
+            "Skip existing files with same size"
         )
 
-        self.copy_radio = QRadioButton(
-            "Copy"
+        self.ignore_space = QCheckBox(
+            "Ignore free-space check"
         )
 
-        self.move_radio = QRadioButton(
-            "Move"
+        self.verify_files = QCheckBox(
+            "Verify copied file size"
         )
 
-        self.copy_radio.setChecked(
+        self.verify_files.setChecked(
             True
         )
 
-        self.skip_existing_checkbox = (
-            QCheckBox(
-                "Skip existing files with matching size"
-            )
+        row1.addWidget(
+            self.skip_existing
         )
 
-        self.verify_checkbox = (
-            QCheckBox(
-                "Verify destination file size"
-            )
+        row1.addWidget(
+            self.ignore_space
         )
 
-        self.order_combo = QComboBox()
-
-        self.order_combo.addItem(
-            "Largest → Smallest",
-            "largest",
+        row1.addWidget(
+            self.verify_files
         )
 
-        self.order_combo.addItem(
-            "Smallest → Largest",
-            "smallest",
+        row2 = QHBoxLayout()
+
+        self.shutdown_on_complete = QCheckBox(
+            "Shutdown computer when transfer completes successfully"
         )
 
-        options_layout.addWidget(
-            self.copy_radio,
-            0,
-            0,
+        row2.addWidget(
+            self.shutdown_on_complete
         )
 
-        options_layout.addWidget(
-            self.move_radio,
-            0,
-            1,
+        row2.addStretch()
+
+        options_layout.addLayout(
+            row1
         )
 
-        options_layout.addWidget(
-            QLabel("File transfer order:"),
-            1,
-            0,
+        options_layout.addLayout(
+            row2
         )
 
-        options_layout.addWidget(
-            self.order_combo,
-            1,
-            1,
+        options_group.setLayout(
+            options_layout
         )
 
-        options_layout.addWidget(
-            self.skip_existing_checkbox,
-            2,
-            0,
-            1,
-            2,
-        )
-
-        options_layout.addWidget(
-            self.verify_checkbox,
-            3,
-            0,
-            1,
-            2,
-        )
-
-        layout.addWidget(
-            options_group
-        )
-
-        # ----------------------------------------------------
-        # Scan
-        # ----------------------------------------------------
-
-        scan_group = QGroupBox(
-            "Folder Statistics"
-        )
-
-        scan_layout = QVBoxLayout(
-            scan_group
-        )
-
-        self.scan_button = QPushButton(
-            "Scan Source & Destination Size"
-        )
-
-        self.scan_button.clicked.connect(
-            self.scan_statistics
-        )
-
-        self.stats_label = QLabel(
-            "Statistics have not been scanned."
-        )
-
-        self.stats_label.setWordWrap(
-            True
-        )
-
-        scan_layout.addWidget(
-            self.scan_button
-        )
-
-        scan_layout.addWidget(
-            self.stats_label
-        )
-
-        layout.addWidget(
-            scan_group
-        )
-
-        # ----------------------------------------------------
-        # Transfer Buttons
-        # ----------------------------------------------------
-
-        buttons_layout = QHBoxLayout()
+        # --------------------------------------------------------------
+        # BUTTONS
+        # --------------------------------------------------------------
 
         self.start_button = QPushButton(
-            "Start Transfer"
-        )
-
-        self.pause_button = QPushButton(
-            "Pause"
-        )
-
-        self.resume_button = QPushButton(
-            "Resume Saved Transfer"
-        )
-
-        self.cancel_button = QPushButton(
-            "Cancel"
+            "Start Copy / Move"
         )
 
         self.start_button.clicked.connect(
             self.start_transfer
         )
 
-        self.pause_button.clicked.connect(
-            self.pause_transfer
+        self.find_button = QPushButton(
+            "Find Missing"
         )
 
-        self.resume_button.clicked.connect(
-            self.resume_transfer
+        self.find_button.clicked.connect(
+            self.find_missing
         )
 
-        self.cancel_button.clicked.connect(
-            self.cancel_transfer
+        self.copy_missing_button = QPushButton(
+            "Copy Missing Files"
+        )
+
+        self.copy_missing_button.setEnabled(
+            False
+        )
+
+        self.copy_missing_button.clicked.connect(
+            self.copy_missing
+        )
+
+        self.pause_button = QPushButton(
+            "Pause"
         )
 
         self.pause_button.setEnabled(
             False
         )
 
-        self.cancel_button.setEnabled(
+        self.pause_button.clicked.connect(
+            self.pause_operation
+        )
+
+        self.resume_button = QPushButton(
+            "Resume"
+        )
+
+        self.resume_button.setEnabled(
             False
         )
 
-        buttons_layout.addWidget(
+        self.resume_button.clicked.connect(
+            self.resume_operation
+        )
+
+        button_layout = QHBoxLayout()
+
+        button_layout.addWidget(
             self.start_button
         )
 
-        buttons_layout.addWidget(
+        button_layout.addWidget(
+            self.find_button
+        )
+
+        button_layout.addWidget(
+            self.copy_missing_button
+        )
+
+        button_layout.addWidget(
             self.pause_button
         )
 
-        buttons_layout.addWidget(
+        button_layout.addWidget(
             self.resume_button
         )
 
-        buttons_layout.addWidget(
-            self.cancel_button
+        # --------------------------------------------------------------
+        # STATISTICS
+        # --------------------------------------------------------------
+
+        self.stats_label = QLabel(
+            "SOURCE\n"
+            "Logical size: —\n"
+            "Files: —\n"
+            "Directories: —\n\n"
+            "DESTINATION VOLUME\n"
+            "Capacity: —\n"
+            "Used: —\n"
+            "Free: —"
         )
 
-        layout.addLayout(
-            buttons_layout
+        self.stats_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignVCenter
         )
 
-        # ----------------------------------------------------
-        # Progress
-        # ----------------------------------------------------
+        self.stats_label.setWordWrap(
+            True
+        )
 
-        self.progress_bar = QProgressBar()
+        # --------------------------------------------------------------
+        # STATUS
+        # --------------------------------------------------------------
 
-        self.progress_bar.setRange(
+        self.status_label = QLabel(
+            "Ready."
+        )
+
+        self.status_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.status_label.setWordWrap(
+            True
+        )
+
+        # --------------------------------------------------------------
+        # PROGRESS
+        # --------------------------------------------------------------
+
+        self.progress = QProgressBar()
+
+        self.progress.setRange(
             0,
             100,
         )
 
-        self.progress_bar.setValue(
+        self.progress.setValue(
             0
         )
 
-        layout.addWidget(
-            self.progress_bar
-        )
+        # --------------------------------------------------------------
+        # LOG
+        # --------------------------------------------------------------
 
-        self.progress_label = QLabel(
-            "Ready."
-        )
+        self.log_view = QTextEdit()
 
-        layout.addWidget(
-            self.progress_label
-        )
-
-        # ----------------------------------------------------
-        # Log
-        # ----------------------------------------------------
-
-        log_group = QGroupBox(
-            "Activity Log"
-        )
-
-        log_layout = QVBoxLayout(
-            log_group
-        )
-
-        self.log_output = QPlainTextEdit()
-
-        self.log_output.setReadOnly(
+        self.log_view.setReadOnly(
             True
         )
 
-        log_layout.addWidget(
-            self.log_output
+        self.log_view.document().setMaximumBlockCount(
+            1500
         )
 
-        layout.addWidget(
-            log_group,
-            1,
+        # --------------------------------------------------------------
+        # LAYOUT
+        # --------------------------------------------------------------
+
+        main = QVBoxLayout()
+
+        main.addLayout(
+            source_layout
         )
 
-        self.append_log(
-            "Safe Transfer started."
+        main.addLayout(
+            destination_layout
         )
 
-        self.append_log(
-            f"Log file: {LOG_FILE}"
+        main.addWidget(
+            self.scan_stats_button
         )
 
-        self.append_log(
-            f"Transfer manifest: {TRANSFER_MANIFEST}"
+        main.addWidget(
+            operation_group
         )
 
-    # ========================================================
-    # Logging
-    # ========================================================
-
-    def append_log(
-        self,
-        message: str,
-    ):
-
-        timestamp = time.strftime(
-            "%H:%M:%S"
+        main.addWidget(
+            sort_group
         )
 
-        self.log_output.appendPlainText(
-            f"[{timestamp}] {message}"
+        main.addWidget(
+            options_group
         )
 
-    # ========================================================
-    # Browse
-    # ========================================================
-
-    def choose_source(self):
-
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Source Folder",
+        main.addWidget(
+            self.stats_label
         )
 
-        if folder:
-
-            self.source_edit.setText(
-                folder
-            )
-
-            self.append_log(
-                f"Source selected: {folder}"
-            )
-
-            # IMPORTANT:
-            # Statistics are NOT automatically scanned.
-
-    def choose_destination(self):
-
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Destination Folder",
+        main.addWidget(
+            self.status_label
         )
 
-        if folder:
+        main.addWidget(
+            self.progress
+        )
 
-            self.destination_edit.setText(
-                folder
-            )
+        main.addLayout(
+            button_layout
+        )
 
-            self.append_log(
-                f"Destination selected: {folder}"
-            )
+        main.addWidget(
+            QLabel("Operation log:")
+        )
 
-            # IMPORTANT:
-            # Statistics are NOT automatically scanned.
+        main.addWidget(
+            self.log_view
+        )
 
-    # ========================================================
-    # Validation
-    # ========================================================
+        self.setLayout(
+            main
+        )
 
-    def get_paths(
-        self,
-    ) -> Optional[
-        tuple[Path, Path]
-    ]:
+        self.check_resume_state()
+
+    # ==================================================================
+    # FOLDER STATISTICS
+    # ==================================================================
+
+    def manual_folder_statistics(self):
 
         source_text = (
             self.source_edit.text().strip()
@@ -1679,7 +2238,7 @@ class MainWindow(QMainWindow):
                 "Please select a source folder.",
             )
 
-            return None
+            return
 
         if not destination_text:
 
@@ -1689,7 +2248,7 @@ class MainWindow(QMainWindow):
                 "Please select a destination folder.",
             )
 
-            return None
+            return
 
         source = Path(
             source_text
@@ -1699,728 +2258,15 @@ class MainWindow(QMainWindow):
             destination_text
         )
 
-        if not source.exists():
+        if (
+            not source.exists()
+            or not source.is_dir()
+        ):
+
             QMessageBox.warning(
                 self,
                 "Invalid Source",
                 "The source folder does not exist.",
-            )
-
-            return None
-
-        if not source.is_dir():
-            QMessageBox.warning(
-                self,
-                "Invalid Source",
-                "The source path is not a folder.",
-            )
-
-            return None
-
-        try:
-
-            source_resolved = (
-                source.resolve()
-            )
-
-            destination_resolved = (
-                destination.resolve()
-            )
-
-            if source_resolved == destination_resolved:
-
-                QMessageBox.warning(
-                    self,
-                    "Invalid Paths",
-                    "Source and destination cannot be the same folder.",
-                )
-
-                return None
-
-        except Exception:
-            pass
-
-        return (
-            source,
-            destination,
-        )
-
-    # ========================================================
-    # Statistics Scan
-    # ========================================================
-
-    def scan_statistics(self):
-
-        paths = self.get_paths()
-
-        if not paths:
-            return
-
-        source, destination = paths
-
-        self.scan_button.setEnabled(
-            False
-        )
-
-        self.stats_label.setText(
-            "Scanning source folder and destination volume..."
-        )
-
-        self.append_log(
-            "Starting manual statistics scan."
-        )
-
-        self.stats_thread = QThread()
-
-        self.stats_worker = (
-            FolderStatsWorker(
-                source,
-                destination,
-            )
-        )
-
-        self.stats_worker.moveToThread(
-            self.stats_thread
-        )
-
-        self.stats_thread.started.connect(
-            self.stats_worker.run
-        )
-
-        self.stats_worker.finished.connect(
-            self._on_stats_ready
-        )
-
-        self.stats_worker.error.connect(
-            self._on_stats_error
-        )
-
-        self.stats_worker.finished.connect(
-            self.stats_thread.quit
-        )
-
-        self.stats_worker.error.connect(
-            self.stats_thread.quit
-        )
-
-        self.stats_thread.finished.connect(
-            self._stats_thread_finished
-        )
-
-        self.stats_thread.start()
-
-    @pyqtSlot(object, object)
-    def _on_stats_ready(
-        self,
-        source_stats: FolderStatistics,
-        destination_stats: dict,
-    ):
-
-        logical = (
-            source_stats.logical_size
-        )
-
-        allocated = (
-            source_stats.allocated_size
-        )
-
-        difference = (
-            source_stats.allocation_difference
-        )
-
-        if difference >= 0:
-
-            allocation_difference_text = (
-                f"+{human_bytes(difference)}"
-            )
-
-        else:
-
-            allocation_difference_text = (
-                human_bytes(difference)
-            )
-
-        if source_stats.largest_file_path:
-
-            largest_text = (
-                f"{human_bytes(source_stats.largest_file_size)}\n"
-                f"{source_stats.largest_file_path}"
-            )
-
-        else:
-
-            largest_text = "None"
-
-        error_text = ""
-
-        if source_stats.scan_errors:
-
-            error_text = (
-                "\n"
-                f"Scan errors: "
-                f"{source_stats.scan_errors:,}"
-            )
-
-        reparse_text = ""
-
-        if source_stats.skipped_reparse_points:
-
-            reparse_text = (
-                "\n"
-                f"Skipped reparse points: "
-                f"{source_stats.skipped_reparse_points:,}"
-            )
-
-        used = (
-            destination_stats["capacity"]
-            - destination_stats["free"]
-        )
-
-        self.stats_label.setText(
-            "SOURCE\n"
-            f"Logical size: {human_bytes(logical)}\n"
-            f"Size on disk: {human_bytes(allocated)}\n"
-            f"Allocation difference: "
-            f"{allocation_difference_text}\n"
-            f"Files: {source_stats.file_count:,}\n"
-            f"Directories: {source_stats.directory_count:,}\n"
-            f"Largest file: {largest_text}"
-            f"{error_text}"
-            f"{reparse_text}"
-            "\n\n"
-            "DESTINATION VOLUME\n"
-            f"Capacity: "
-            f"{human_bytes(destination_stats['capacity'])}\n"
-            f"Used: "
-            f"{human_bytes(used)}\n"
-            f"Free: "
-            f"{human_bytes(destination_stats['free'])}\n"
-            f"Available to this process: "
-            f"{human_bytes(destination_stats['available'])}"
-        )
-
-        self.append_log(
-            "Statistics scan complete."
-        )
-
-        self.append_log(
-            f"Source logical size: "
-            f"{logical:,} bytes"
-        )
-
-        self.append_log(
-            f"Source size on disk: "
-            f"{allocated:,} bytes"
-        )
-
-        self.append_log(
-            f"Destination capacity: "
-            f"{destination_stats['capacity']:,} bytes"
-        )
-
-        self.append_log(
-            f"Destination free: "
-            f"{destination_stats['free']:,} bytes"
-        )
-
-    @pyqtSlot(str)
-    def _on_stats_error(
-        self,
-        error: str,
-    ):
-
-        self.stats_label.setText(
-            f"Statistics scan failed:\n{error}"
-        )
-
-        self.append_log(
-            f"Statistics error: {error}"
-        )
-
-        QMessageBox.warning(
-            self,
-            "Statistics Scan Failed",
-            error,
-        )
-
-    def _stats_thread_finished(self):
-
-        self.scan_button.setEnabled(
-            True
-        )
-
-        self.stats_thread = None
-
-        self.stats_worker = None
-
-    # ========================================================
-    # Build Transfer Manifest
-    # ========================================================
-
-    def build_transfer_manifest(
-        self,
-        source: Path,
-        order: str,
-    ) -> list[TransferFile]:
-
-        self.append_log(
-            "Scanning source files..."
-        )
-
-        files, errors = (
-            scan_transfer_files(
-                source
-            )
-        )
-
-        self.append_log(
-            f"Found {len(files):,} files."
-        )
-
-        if errors:
-
-            self.append_log(
-                f"File scan errors: {errors:,}"
-            )
-
-        if order == "largest":
-
-            files.sort(
-                key=lambda item: item.size,
-                reverse=True,
-            )
-
-            order_name = (
-                "Largest -> Smallest"
-            )
-
-        else:
-
-            files.sort(
-                key=lambda item: item.size
-            )
-
-            order_name = (
-                "Smallest -> Largest"
-            )
-
-        save_manifest(
-            files,
-            order_name,
-        )
-
-        self.append_log(
-            f"Transfer order: {order_name}"
-        )
-
-        self.append_log(
-            f"Manifest saved: {TRANSFER_MANIFEST}"
-        )
-
-        return files
-
-    # ========================================================
-    # Start Transfer
-    # ========================================================
-
-    def start_transfer(self):
-
-        paths = self.get_paths()
-
-        if not paths:
-            return
-
-        source, destination = paths
-
-        order = (
-            self.order_combo.currentData()
-        )
-
-        move_files = (
-            self.move_radio.isChecked()
-        )
-
-        skip_existing = (
-            self.skip_existing_checkbox.isChecked()
-        )
-
-        verify = (
-            self.verify_checkbox.isChecked()
-        )
-
-        if destination.exists():
-
-            try:
-
-                destination.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-            except Exception as exc:
-
-                QMessageBox.critical(
-                    self,
-                    "Destination Error",
-                    str(exc),
-                )
-
-                return
-
-        else:
-
-            try:
-
-                destination.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-            except Exception as exc:
-
-                QMessageBox.critical(
-                    self,
-                    "Destination Error",
-                    str(exc),
-                )
-
-                return
-
-        # ----------------------------------------------------
-        # Scan files
-        # ----------------------------------------------------
-
-        try:
-
-            files = (
-                self.build_transfer_manifest(
-                    source,
-                    order,
-                )
-            )
-
-        except Exception as exc:
-
-            QMessageBox.critical(
-                self,
-                "File Scan Failed",
-                str(exc),
-            )
-
-            self.append_log(
-                f"File scan failed: {exc}"
-            )
-
-            return
-
-        if not files:
-
-            QMessageBox.information(
-                self,
-                "Nothing to Transfer",
-                "No files were found in the source folder.",
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Destination free-space check
-        # ----------------------------------------------------
-
-        try:
-
-            (
-                available,
-                capacity,
-                free,
-            ) = get_volume_statistics(
-                destination
-            )
-
-            total_size = sum(
-                item.size
-                for item in files
-            )
-
-            self.append_log(
-                f"Transfer logical size: "
-                f"{total_size:,} bytes"
-            )
-
-            self.append_log(
-                f"Destination available: "
-                f"{available:,} bytes"
-            )
-
-            if available < total_size:
-
-                result = QMessageBox.warning(
-                    self,
-                    "Insufficient Free Space",
-                    (
-                        "The destination does not appear "
-                        "to have enough available space.\n\n"
-                        f"Required: {human_bytes(total_size)}\n"
-                        f"Available: {human_bytes(available)}\n\n"
-                        "Continue anyway?"
-                    ),
-                    QMessageBox.StandardButton.Yes
-                    | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-
-                if (
-                    result
-                    != QMessageBox.StandardButton.Yes
-                ):
-
-                    return
-
-        except Exception as exc:
-
-            self.append_log(
-                f"Could not determine destination free space: {exc}"
-            )
-
-            result = QMessageBox.warning(
-                self,
-                "Free Space Check Failed",
-                (
-                    "Windows could not determine "
-                    "destination free space.\n\n"
-                    f"{exc}\n\n"
-                    "Continue anyway?"
-                ),
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-
-            if (
-                result
-                != QMessageBox.StandardButton.Yes
-            ):
-
-                return
-
-        # ----------------------------------------------------
-        # Confirmation
-        # ----------------------------------------------------
-
-        action = (
-            "MOVE"
-            if move_files
-            else "COPY"
-        )
-
-        order_name = (
-            "Largest -> Smallest"
-            if order == "largest"
-            else "Smallest -> Largest"
-        )
-
-        total_size = sum(
-            item.size
-            for item in files
-        )
-
-        message = (
-            f"Operation: {action}\n\n"
-            f"Source:\n{source}\n\n"
-            f"Destination:\n{destination}\n\n"
-            f"Files: {len(files):,}\n"
-            f"Logical size: {human_bytes(total_size)}\n"
-            f"Order: {order_name}\n\n"
-            "The complete folder structure will be "
-            "created before files are transferred."
-        )
-
-        if move_files:
-
-            message += (
-                "\n\n"
-                "MOVE mode will delete each source file "
-                "only after its destination copy succeeds."
-            )
-
-        result = QMessageBox.question(
-            self,
-            "Start Transfer",
-            message,
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-
-        if (
-            result
-            != QMessageBox.StandardButton.Yes
-        ):
-
-            return
-
-        self.current_files = files
-
-        self.launch_transfer(
-            source,
-            destination,
-            files,
-            move_files,
-            skip_existing,
-            verify,
-            0,
-        )
-
-    # ========================================================
-    # Launch Transfer
-    # ========================================================
-
-    def launch_transfer(
-        self,
-        source: Path,
-        destination: Path,
-        files: list[TransferFile],
-        move_files: bool,
-        skip_existing: bool,
-        verify: bool,
-        start_index: int,
-    ):
-
-        self.transfer_thread = QThread()
-
-        self.transfer_worker = (
-            TransferWorker(
-                source=source,
-                destination=destination,
-                files=files,
-                move_files=move_files,
-                skip_existing=skip_existing,
-                verify=verify,
-                start_index=start_index,
-            )
-        )
-
-        self.transfer_worker.moveToThread(
-            self.transfer_thread
-        )
-
-        self.transfer_thread.started.connect(
-            self.transfer_worker.run
-        )
-
-        self.transfer_worker.progress.connect(
-            self._on_transfer_progress
-        )
-
-        self.transfer_worker.status.connect(
-            self._on_transfer_status
-        )
-
-        self.transfer_worker.finished.connect(
-            self._on_transfer_finished
-        )
-
-        self.transfer_worker.paused.connect(
-            self._on_transfer_paused
-        )
-
-        self.transfer_worker.error.connect(
-            self._on_transfer_error
-        )
-
-        self.transfer_worker.finished.connect(
-            self.transfer_thread.quit
-        )
-
-        self.transfer_worker.paused.connect(
-            self.transfer_thread.quit
-        )
-
-        self.transfer_worker.error.connect(
-            self.transfer_thread.quit
-        )
-
-        self.transfer_thread.finished.connect(
-            self._transfer_thread_finished
-        )
-
-        self.set_transfer_running(
-            True
-        )
-
-        self.transfer_start_time = (
-            time.monotonic()
-        )
-
-        self.append_log(
-            f"Starting transfer at file "
-            f"{start_index + 1:,}."
-        )
-
-        self.transfer_thread.start()
-
-    # ========================================================
-    # Pause
-    # ========================================================
-
-    def pause_transfer(self):
-
-        if self.transfer_worker:
-
-            self.append_log(
-                "Pause requested..."
-            )
-
-            self.transfer_worker.request_pause()
-
-    # ========================================================
-    # Resume
-    # ========================================================
-
-    def resume_transfer(self):
-
-        state = load_pause_state()
-
-        if not state:
-
-            QMessageBox.information(
-                self,
-                "No Saved Transfer",
-                "There is no saved paused transfer.",
-            )
-
-            return
-
-        source = Path(
-            state["source"]
-        )
-
-        destination = Path(
-            state["destination"]
-        )
-
-        files = [
-            TransferFile(
-                source=item["source"],
-                relative_path=item["relative_path"],
-                size=int(item["size"]),
-            )
-            for item in state["files"]
-        ]
-
-        current_index = int(
-            state.get(
-                "current_index",
-                0,
-            )
-        )
-
-        if not source.exists():
-
-            QMessageBox.warning(
-                self,
-                "Source Missing",
-                f"Source folder no longer exists:\n{source}",
             )
 
             return
@@ -2432,345 +2278,1558 @@ class MainWindow(QMainWindow):
                 exist_ok=True,
             )
 
-        except Exception as exc:
+        except Exception as e:
 
-            QMessageBox.critical(
+            QMessageBox.warning(
                 self,
                 "Destination Error",
-                str(exc),
+                str(e),
             )
 
             return
 
-        self.source_edit.setText(
-            str(source)
+        if (
+            self.stats_worker
+            and self.stats_worker.isRunning()
+        ):
+
+            return
+
+        self.stats_label.setText(
+            "Scanning source and "
+            "destination..."
         )
 
-        self.destination_edit.setText(
-            str(destination)
+        self.scan_stats_button.setEnabled(
+            False
         )
 
-        self.current_files = files
-
-        self.append_log(
-            f"Resuming saved transfer at file "
-            f"{current_index + 1:,}."
-        )
-
-        self.launch_transfer(
+        self.stats_worker = FolderStatsWorker(
             source,
             destination,
-            files,
-            self.move_radio.isChecked(),
-            self.skip_existing_checkbox.isChecked(),
-            self.verify_checkbox.isChecked(),
-            current_index,
         )
 
-    # ========================================================
-    # Cancel
-    # ========================================================
+        self.stats_worker.result.connect(
+            self._on_stats_ready
+        )
 
-    def cancel_transfer(self):
+        self.stats_worker.error.connect(
+            self._stats_error
+        )
 
-        if self.transfer_worker:
+        self.stats_worker.finished.connect(
+            self._stats_finished
+        )
 
-            self.append_log(
-                "Cancel requested..."
-            )
+        self.stats_worker.start()
 
-            self.transfer_worker.request_cancel()
+    def _stats_finished(self):
 
-    # ========================================================
-    # Transfer Progress
-    # ========================================================
+        self.stats_worker = None
 
-    @pyqtSlot(
-        int,
-        int,
-        int,
-        str,
-    )
-    def _on_transfer_progress(
+        self.scan_stats_button.setEnabled(
+            True
+        )
+
+    def _stats_error(
         self,
-        transferred: int,
-        total: int,
-        file_number: int,
-        filename: str,
+        message,
     ):
 
-        if total > 0:
+        self.stats_label.setText(
+            f"Statistics error:\n{message}"
+        )
 
-            percent = int(
-                (
-                    transferred
-                    / total
+        self.append_log(
+            f"STATISTICS ERROR: {message}"
+        )
+
+    def _on_stats_ready(
+        self,
+        source_stats,
+        destination_stats,
+    ):
+
+        if source_stats:
+
+            logical = (
+                source_stats.logical_size
+            )
+
+            largest_text = "—"
+
+            if (
+                source_stats.largest_file_size
+                > 0
+            ):
+
+                largest_text = (
+                    f"{human_bytes(source_stats.largest_file_size)} "
+                    f"— "
+                    f"{source_stats.largest_file_path}"
                 )
-                * 100
+
+            error_text = ""
+
+            if source_stats.errors:
+
+                error_text = (
+                    "\n"
+                    f"Scan errors: "
+                    f"{source_stats.errors:,}"
+                )
+
+            reparse_text = ""
+
+            if source_stats.reparse_points:
+
+                reparse_text = (
+                    "\n"
+                    f"Skipped reparse points: "
+                    f"{source_stats.reparse_points:,}"
+                )
+
+            self.stats_label.setText(
+                "SOURCE\n"
+                f"Logical size: "
+                f"{human_bytes(logical)}\n"
+                f"Files: "
+                f"{source_stats.file_count:,}\n"
+                f"Directories: "
+                f"{source_stats.directory_count:,}\n"
+                f"Largest file: "
+                f"{largest_text}"
+                f"{error_text}"
+                f"{reparse_text}"
+                "\n\n"
+                "DESTINATION VOLUME\n"
+                f"Capacity: "
+                f"{human_bytes(destination_stats['capacity'])}\n"
+                f"Used: "
+                f"{human_bytes(destination_stats['used'])}\n"
+                f"Free: "
+                f"{human_bytes(destination_stats['free'])}\n"
+                f"Available to this process: "
+                f"{human_bytes(destination_stats['available'])}"
             )
 
-        else:
+        elif destination_stats:
 
-            percent = 0
-
-        self.progress_bar.setValue(
-            max(
-                0,
-                min(
-                    100,
-                    percent,
-                ),
-            )
-        )
-
-        elapsed = (
-            time.monotonic()
-            - self.transfer_start_time
-        )
-
-        if elapsed > 0:
-
-            speed = (
-                transferred
-                / elapsed
+            self.stats_label.setText(
+                "SOURCE\n"
+                "Unavailable\n\n"
+                "DESTINATION VOLUME\n"
+                f"Capacity: "
+                f"{human_bytes(destination_stats['capacity'])}\n"
+                f"Used: "
+                f"{human_bytes(destination_stats['used'])}\n"
+                f"Free: "
+                f"{human_bytes(destination_stats['free'])}\n"
+                f"Available to this process: "
+                f"{human_bytes(destination_stats['available'])}"
             )
 
-        else:
+    # ==================================================================
+    # LOGGING
+    # ==================================================================
 
-            speed = 0
-
-        self.progress_label.setText(
-            f"{percent}% | "
-            f"{human_bytes(transferred)} / "
-            f"{human_bytes(total)} | "
-            f"{human_bytes(speed)}/s | "
-            f"File {file_number:,}"
-        )
-
-        self.statusBar().showMessage(
-            filename
-        )
-
-    @pyqtSlot(str)
-    def _on_transfer_status(
+    def append_log(
         self,
         message: str,
     ):
 
-        self.append_log(
+        self.log_view.append(
             message
         )
 
-    # ========================================================
-    # Transfer Finished
-    # ========================================================
+        append_log(
+            message
+        )
 
-    def _on_transfer_finished(self):
+    # ==================================================================
+    # CONTROLS
+    # ==================================================================
 
-        self.progress_bar.setValue(
+    def set_controls_enabled(
+        self,
+        enabled: bool,
+    ):
+
+        self.source_button.setEnabled(
+            enabled
+        )
+
+        self.destination_button.setEnabled(
+            enabled
+        )
+
+        self.source_edit.setEnabled(
+            enabled
+        )
+
+        self.destination_edit.setEnabled(
+            enabled
+        )
+
+        self.operation_combo.setEnabled(
+            enabled
+        )
+
+        self.sort_combo.setEnabled(
+            enabled
+        )
+
+        self.skip_existing.setEnabled(
+            enabled
+        )
+
+        self.ignore_space.setEnabled(
+            enabled
+        )
+
+        self.verify_files.setEnabled(
+            enabled
+        )
+
+        self.shutdown_on_complete.setEnabled(
+            enabled
+        )
+
+        self.start_button.setEnabled(
+            enabled
+        )
+
+        self.find_button.setEnabled(
+            enabled
+        )
+
+        self.scan_stats_button.setEnabled(
+            enabled
+        )
+
+    # ==================================================================
+    # BROWSING
+    # ==================================================================
+
+    def browse_source(self):
+
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Source Folder",
+        )
+
+        if directory:
+
+            self.source_edit.setText(
+                directory
+            )
+
+    def browse_destination(self):
+
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Destination Folder",
+        )
+
+        if directory:
+
+            self.destination_edit.setText(
+                directory
+            )
+
+    # ==================================================================
+    # PATH VALIDATION
+    # ==================================================================
+
+    def get_paths(self):
+
+        source_text = (
+            self.source_edit.text().strip()
+        )
+
+        destination_text = (
+            self.destination_edit.text().strip()
+        )
+
+        if not source_text:
+
+            QMessageBox.warning(
+                self,
+                "Invalid Source",
+                "Please provide a source folder.",
+            )
+
+            return None, None
+
+        if not destination_text:
+
+            QMessageBox.warning(
+                self,
+                "Missing Destination",
+                "Please select a destination folder.",
+            )
+
+            return None, None
+
+        source = Path(
+            source_text
+        )
+
+        destination = Path(
+            destination_text
+        )
+
+        if (
+            not source.exists()
+            or not source.is_dir()
+        ):
+
+            QMessageBox.warning(
+                self,
+                "Invalid Source",
+                "Please provide a valid source folder.",
+            )
+
+            return None, None
+
+        try:
+
+            source_resolved = (
+                source.resolve()
+            )
+
+            destination_resolved = (
+                destination.resolve()
+            )
+
+            if (
+                source_resolved
+                == destination_resolved
+            ):
+
+                QMessageBox.warning(
+                    self,
+                    "Invalid Paths",
+                    "Source and destination cannot match.",
+                )
+
+                return None, None
+
+            try:
+
+                destination_resolved.relative_to(
+                    source_resolved
+                )
+
+                QMessageBox.warning(
+                    self,
+                    "Invalid Paths",
+                    "The destination cannot be "
+                    "inside the source folder.",
+                )
+
+                return None, None
+
+            except ValueError:
+
+                pass
+
+            destination.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+        except Exception as e:
+
+            QMessageBox.critical(
+                self,
+                "Destination Error",
+                f"Cannot create destination:\n\n{e}",
+            )
+
+            return None, None
+
+        return source, destination
+
+    # ==================================================================
+    # FIND MISSING
+    # ==================================================================
+
+    def find_missing(self):
+
+        if (
+            self.worker
+            and self.worker.isRunning()
+        ):
+
+            QMessageBox.information(
+                self,
+                "Busy",
+                "An operation is currently running.",
+            )
+
+            return
+
+        source, destination = (
+            self.get_paths()
+        )
+
+        if not source:
+            return
+
+        self.source = source
+
+        self.destination = (
+            destination
+        )
+
+        self.missing_files.clear()
+
+        self.copy_missing_button.setEnabled(
+            False
+        )
+
+        self.progress.setValue(
+            0
+        )
+
+        self.status_label.setText(
+            "Finding missing files..."
+        )
+
+        self.set_controls_enabled(
+            False
+        )
+
+        self.append_log(
+            "=== Missing-file scan started ==="
+        )
+
+        self.scan_worker = (
+            MissingFilesScanner(
+                source,
+                destination,
+            )
+        )
+
+        self.scan_worker.progress.connect(
+            self.progress.setValue
+        )
+
+        self.scan_worker.status.connect(
+            self.status_label.setText
+        )
+
+        self.scan_worker.result.connect(
+            self.missing_scan_finished
+        )
+
+        self.scan_worker.error.connect(
+            self.operation_error
+        )
+
+        self.scan_worker.finished.connect(
+            self.scan_finished
+        )
+
+        self.scan_worker.start()
+
+    def missing_scan_finished(
+        self,
+        missing,
+        total,
+        inaccessible,
+    ):
+
+        self.missing_files = missing
+
+        self.progress.setValue(
             100
         )
 
-        self.progress_label.setText(
-            "Transfer complete."
+        if missing:
+
+            self.append_log(
+                f"Found {len(missing):,} "
+                "missing files."
+            )
+
+            self.status_label.setText(
+                f"Found {len(missing):,} "
+                f"missing files out of "
+                f"{total:,}."
+            )
+
+            self.copy_missing_button.setEnabled(
+                True
+            )
+
+            self.log_view.append(
+                "\n--- Missing Files ---"
+            )
+
+            for path in missing[:500]:
+
+                self.log_view.append(
+                    str(path)
+                )
+
+            if len(missing) > 500:
+
+                self.log_view.append(
+                    f"...and "
+                    f"{len(missing) - 500:,} "
+                    "more files."
+                )
+
+        else:
+
+            self.status_label.setText(
+                "No missing files found."
+            )
+
+            self.append_log(
+                "No missing files found."
+            )
+
+        if inaccessible:
+
+            self.append_log(
+                f"WARNING: "
+                f"{inaccessible:,} "
+                "file/directory item(s) "
+                "could not be inspected."
+            )
+
+    def scan_finished(self):
+
+        self.set_controls_enabled(
+            True
         )
 
-        self.append_log(
-            "Transfer complete."
-        )
+        self.scan_worker = None
 
-        self.set_transfer_running(
-            False
-        )
+    # ==================================================================
+    # COPY MISSING
+    # ==================================================================
 
-        QMessageBox.information(
+    def copy_missing(self):
+
+        if (
+            not self.missing_files
+            or not self.source
+            or not self.destination
+        ):
+            return
+
+        answer = QMessageBox.question(
             self,
-            "Transfer Complete",
-            "The transfer completed successfully.",
-        )
-
-    # ========================================================
-    # Transfer Paused
-    # ========================================================
-
-    def _on_transfer_paused(self):
-
-        self.progress_label.setText(
-            "Transfer paused."
-        )
-
-        self.append_log(
-            "Transfer paused. Resume state saved."
-        )
-
-        self.set_transfer_running(
-            False
-        )
-
-        QMessageBox.information(
-            self,
-            "Transfer Paused",
+            "Copy Missing Files",
             (
-                "The transfer has been paused.\n\n"
-                "Your progress was saved and can be "
-                "resumed with 'Resume Saved Transfer'."
+                f"Copy "
+                f"{len(self.missing_files):,} "
+                "missing file(s) to destination?"
             ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
         )
 
-    # ========================================================
-    # Transfer Error
-    # ========================================================
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
 
-    def _on_transfer_error(
+        files = []
+
+        for relative in self.missing_files:
+
+            src = (
+                self.source
+                / relative
+            )
+
+            try:
+
+                files.append(
+                    (
+                        src,
+                        src.stat().st_size,
+                    )
+                )
+
+            except Exception as e:
+
+                self.append_log(
+                    f"FAILED TO STAT "
+                    f"{relative}: {e}"
+                )
+
+        self.start_transfer_with_files(
+            files,
+            move=False,
+        )
+
+    # ==================================================================
+    # START TRANSFER
+    # ==================================================================
+
+    def start_transfer(self):
+
+        if (
+            self.worker
+            and self.worker.isRunning()
+        ):
+
+            QMessageBox.information(
+                self,
+                "Busy",
+                "An operation is currently running.",
+            )
+
+            return
+
+        source, destination = (
+            self.get_paths()
+        )
+
+        if not source:
+            return
+
+        self.source = source
+
+        self.destination = (
+            destination
+        )
+
+        self.append_log(
+            "=== Building file list ==="
+        )
+
+        self.set_controls_enabled(
+            False
+        )
+
+        self.progress.setValue(
+            0
+        )
+
+        self.status_label.setText(
+            "Scanning source directory..."
+        )
+
+        sort_mode = (
+            self.sort_combo.currentText()
+        )
+
+        self.scan_worker = FileScanner(
+            source,
+            sort_mode,
+        )
+
+        self.scan_worker.progress.connect(
+            self.progress.setValue
+        )
+
+        self.scan_worker.status.connect(
+            self.status_label.setText
+        )
+
+        self.scan_worker.result.connect(
+            self.file_list_ready
+        )
+
+        self.scan_worker.error.connect(
+            self.operation_error
+        )
+
+        self.scan_worker.finished.connect(
+            self.scan_finished
+        )
+
+        self.scan_worker.start()
+
+    def file_list_ready(
         self,
-        error: str,
+        files,
+        total,
+        inaccessible,
     ):
 
-        self.progress_label.setText(
-            "Transfer stopped."
+        self.file_list = files
+
+        if not files:
+
+            self.set_controls_enabled(
+                True
+            )
+
+            QMessageBox.warning(
+                self,
+                "No Files",
+                "No files found in source folder.",
+            )
+
+            return
+
+        if inaccessible:
+
+            self.append_log(
+                f"WARNING: "
+                f"{inaccessible:,} "
+                "inaccessible "
+                "file/directory item(s) skipped."
+            )
+
+        move = (
+            self.operation_combo.currentText()
+            == "Move"
+        )
+
+        self.start_transfer_with_files(
+            files,
+            move,
+        )
+
+    def start_transfer_with_files(
+        self,
+        files,
+        move=False,
+        start_index=0,
+    ):
+
+        if not files:
+
+            self.set_controls_enabled(
+                True
+            )
+
+            return
+
+        self.current_operation = (
+            "move"
+            if move
+            else "copy"
+        )
+
+        self.progress.setValue(
+            0
+        )
+
+        self.status_label.setText(
+            "Starting transfer..."
+        )
+
+        skip = (
+            self.skip_existing.isChecked()
+        )
+
+        ignore_space = (
+            self.ignore_space.isChecked()
+        )
+
+        verify = (
+            self.verify_files.isChecked()
+        )
+
+        shutdown = (
+            self.shutdown_on_complete.isChecked()
+        )
+
+        self.worker = TransferWorker(
+            self.source,
+            self.destination,
+            files,
+            move,
+            skip,
+            ignore_space,
+            verify,
+            shutdown,
+            start_index,
+        )
+
+        self.worker.progress.connect(
+            self.progress.setValue
+        )
+
+        self.worker.status.connect(
+            self.status_label.setText
+        )
+
+        self.worker.statistics.connect(
+            self.status_label.setText
+        )
+
+        self.worker.log.connect(
+            self.append_log
+        )
+
+        self.worker.finished_result.connect(
+            self.transfer_finished
+        )
+
+        self.worker.error.connect(
+            self.operation_error
+        )
+
+        self.worker.finished.connect(
+            self.worker_finished
+        )
+
+        self.set_controls_enabled(
+            False
+        )
+
+        self.pause_button.setEnabled(
+            True
+        )
+
+        self.resume_button.setEnabled(
+            False
+        )
+
+        self.copy_missing_button.setEnabled(
+            False
         )
 
         self.append_log(
-            f"Transfer error: {error}"
+            "=== "
+            f"{'MOVE' if move else 'COPY'} "
+            "started ==="
         )
 
-        self.set_transfer_running(
-            False
+        self.append_log(
+            "Transfer order: "
+            f"{self.sort_combo.currentText()}"
+        )
+
+        if shutdown:
+
+            self.append_log(
+                "Shutdown on successful "
+                "completion: ENABLED"
+            )
+
+        self.worker.start()
+
+    # ==================================================================
+    # PAUSE / RESUME
+    # ==================================================================
+
+    def pause_operation(self):
+
+        if (
+            self.worker
+            and self.worker.isRunning()
+        ):
+
+            self.pause_button.setEnabled(
+                False
+            )
+
+            self.status_label.setText(
+                "Pause requested. "
+                "Completing current file..."
+            )
+
+            self.append_log(
+                "=== Pause requested ==="
+            )
+
+            self.worker.request_pause()
+
+    def check_resume_state(self):
+
+        state = load_state()
+
+        if (
+            state
+            and state.get(
+                "Paused",
+                False,
+            )
+        ):
+
+            self.resume_button.setEnabled(
+                True
+            )
+
+            self.append_log(
+                "Paused job found: "
+                f"{state.get('Source')} "
+                "→ "
+                f"{state.get('Destination')}"
+            )
+
+    def resume_operation(self):
+
+        state = load_state()
+
+        if not state:
+
+            QMessageBox.warning(
+                self,
+                "No State",
+                "No paused job state file found.",
+            )
+
+            self.resume_button.setEnabled(
+                False
+            )
+
+            return
+
+        try:
+
+            self.source = Path(
+                state["Source"]
+            )
+
+            self.destination = Path(
+                state["Destination"]
+            )
+
+            start_index = int(
+                state.get(
+                    "Index",
+                    0,
+                )
+            )
+
+            move = bool(
+                state.get(
+                    "Move",
+                    False,
+                )
+            )
+
+            skip = bool(
+                state.get(
+                    "SkipExisting",
+                    False,
+                )
+            )
+
+            ignore_space = bool(
+                state.get(
+                    "IgnoreSpace",
+                    False,
+                )
+            )
+
+            verify = bool(
+                state.get(
+                    "VerifyFiles",
+                    True,
+                )
+            )
+
+            shutdown = bool(
+                state.get(
+                    "ShutdownOnComplete",
+                    False,
+                )
+            )
+
+            if not self.source.exists():
+
+                QMessageBox.critical(
+                    self,
+                    "Resume Error",
+                    "Original source path "
+                    "no longer exists.",
+                )
+
+                return
+
+            self.source_edit.setText(
+                str(self.source)
+            )
+
+            self.destination_edit.setText(
+                str(self.destination)
+            )
+
+            self.skip_existing.setChecked(
+                skip
+            )
+
+            self.ignore_space.setChecked(
+                ignore_space
+            )
+
+            self.verify_files.setChecked(
+                verify
+            )
+
+            self.shutdown_on_complete.setChecked(
+                shutdown
+            )
+
+            self.status_label.setText(
+                "Rebuilding file list "
+                "for resume..."
+            )
+
+            self.set_controls_enabled(
+                False
+            )
+
+            sort_mode = (
+                state.get(
+                    "SortMode",
+                    "Largest → Smallest",
+                )
+            )
+
+            index = (
+                0
+                if sort_mode
+                == "Largest → Smallest"
+                else 1
+            )
+
+            self.sort_combo.setCurrentIndex(
+                index
+            )
+
+            self.scan_worker = FileScanner(
+                self.source,
+                sort_mode,
+            )
+
+            self.scan_worker.progress.connect(
+                self.progress.setValue
+            )
+
+            self.scan_worker.status.connect(
+                self.status_label.setText
+            )
+
+            def resume_files(
+                files,
+                total,
+                inaccessible,
+            ):
+
+                self.file_list = files
+
+                if inaccessible:
+
+                    self.append_log(
+                        "WARNING: "
+                        f"{inaccessible:,} "
+                        "items could not be "
+                        "inspected during "
+                        "resume scan."
+                    )
+
+                if start_index >= len(files):
+
+                    QMessageBox.information(
+                        self,
+                        "Resume",
+                        "Operation already completed.",
+                    )
+
+                    delete_state()
+
+                    self.set_controls_enabled(
+                        True
+                    )
+
+                    self.resume_button.setEnabled(
+                        False
+                    )
+
+                    return
+
+                self.start_transfer_with_files(
+                    files,
+                    move=move,
+                    start_index=start_index,
+                )
+
+            self.scan_worker.result.connect(
+                resume_files
+            )
+
+            self.scan_worker.error.connect(
+                self.operation_error
+            )
+
+            self.scan_worker.finished.connect(
+                self.scan_finished
+            )
+
+            self.scan_worker.start()
+
+        except Exception as e:
+
+            QMessageBox.critical(
+                self,
+                "Resume Error",
+                str(e),
+            )
+
+            self.set_controls_enabled(
+                True
+            )
+
+    # ==================================================================
+    # TRANSFER COMPLETION
+    # ==================================================================
+
+    def transfer_finished(
+        self,
+        result,
+    ):
+
+        if result.get(
+            "paused",
+            False,
+        ):
+
+            self.status_label.setText(
+                "Operation paused."
+            )
+
+            self.append_log(
+                "=== Operation PAUSED ==="
+            )
+
+            self.resume_button.setEnabled(
+                True
+            )
+
+            self.pause_button.setEnabled(
+                False
+            )
+
+            return
+
+        copied = result.get(
+            "copied",
+            0,
+        )
+
+        skipped = result.get(
+            "skipped",
+            0,
+        )
+
+        failed = result.get(
+            "failed",
+            [],
+        )
+
+        bytes_copied = result.get(
+            "bytes",
+            0,
+        )
+
+        success = result.get(
+            "success",
+            False,
+        )
+
+        shutdown_requested = result.get(
+            "shutdown_on_complete",
+            False,
+        )
+
+        if "message" in result:
+
+            QMessageBox.critical(
+                self,
+                "Transfer Failed",
+                result["message"],
+            )
+
+            self.append_log(
+                result["message"]
+            )
+
+            return
+
+        if failed:
+
+            self.append_log(
+                "=== Operation completed "
+                f"with {len(failed):,} "
+                "error(s) ==="
+            )
+
+            self.log_view.append(
+                "\n--- Failed Files ---"
+            )
+
+            for filename, error in failed:
+
+                self.log_view.append(
+                    f"{filename}: {error}"
+                )
+
+        if (
+            self.current_operation
+            == "move"
+            and success
+            and not failed
+        ):
+
+            self.status_label.setText(
+                "Transfer successful. "
+                "Removing source files..."
+            )
+
+            self.remove_source_after_move(
+                result
+            )
+
+        else:
+
+            self.finish_transfer_ui(
+                copied,
+                skipped,
+                failed,
+                bytes_copied,
+                success,
+                shutdown_requested,
+            )
+
+    def remove_source_after_move(
+        self,
+        result,
+    ):
+
+        successful_files = result.get(
+            "successful_source_files",
+            [],
+        )
+
+        deleted = 0
+
+        delete_errors = []
+
+        for src in successful_files:
+
+            try:
+
+                if src.exists():
+
+                    src.unlink()
+
+                    deleted += 1
+
+            except Exception as e:
+
+                delete_errors.append(
+                    (
+                        str(src),
+                        str(e),
+                    )
+                )
+
+        try:
+
+            directories = []
+
+            for current_root, dirs, files in os.walk(
+                self.source,
+                topdown=False,
+                followlinks=False,
+            ):
+
+                for dirname in dirs:
+
+                    directory = (
+                        Path(current_root)
+                        / dirname
+                    )
+
+                    if directory.is_symlink():
+                        continue
+
+                    directories.append(
+                        directory
+                    )
+
+            directories.append(
+                self.source
+            )
+
+            for directory in directories:
+
+                try:
+
+                    directory.rmdir()
+
+                except OSError:
+
+                    pass
+
+        except Exception as e:
+
+            delete_errors.append(
+                (
+                    str(self.source),
+                    str(e),
+                )
+            )
+
+        if delete_errors:
+
+            self.append_log(
+                "PARTIAL - move completed "
+                "but source cleanup had errors."
+            )
+
+            self.log_view.append(
+                "\n--- Source Cleanup Errors ---"
+            )
+
+            for filename, error in delete_errors:
+
+                self.log_view.append(
+                    f"{filename}: {error}"
+                )
+
+            self.finish_transfer_ui(
+                result.get("copied", 0),
+                result.get("skipped", 0),
+                delete_errors,
+                result.get("bytes", 0),
+                False,
+                False,
+            )
+
+        else:
+
+            self.append_log(
+                "SUCCESS - MOVE completed. "
+                f"Deleted {deleted:,} "
+                "source files."
+            )
+
+            self.finish_transfer_ui(
+                result.get("copied", 0),
+                result.get("skipped", 0),
+                [],
+                result.get("bytes", 0),
+                True,
+                result.get(
+                    "shutdown_on_complete",
+                    False,
+                ),
+            )
+
+    def finish_transfer_ui(
+        self,
+        copied,
+        skipped,
+        failed,
+        bytes_copied,
+        success,
+        shutdown_on_complete=False,
+    ):
+
+        self.progress.setValue(
+            100
+        )
+
+        self.status_label.setText(
+            "Operation completed."
+        )
+
+        if failed:
+
+            self.status_label.setText(
+                "Completed with errors: "
+                f"{len(failed):,} failed."
+            )
+
+            QMessageBox.warning(
+                self,
+                "Completed With Errors",
+                (
+                    f"Copied: {copied:,}\n"
+                    f"Skipped: {skipped:,}\n"
+                    f"Failed: "
+                    f"{len(failed):,}\n"
+                    f"Transferred: "
+                    f"{human_bytes(bytes_copied)}"
+                ),
+            )
+
+        else:
+
+            self.status_label.setText(
+                "Operation completed successfully. "
+                f"Copied: {copied:,}, "
+                f"Skipped: {skipped:,}"
+            )
+
+            QMessageBox.information(
+                self,
+                "Operation Complete",
+                (
+                    f"Copied: {copied:,}\n"
+                    f"Skipped: {skipped:,}\n"
+                    f"Transferred: "
+                    f"{human_bytes(bytes_copied)}"
+                ),
+            )
+
+        if success:
+
+            delete_state()
+
+            if shutdown_on_complete:
+
+                self.append_log(
+                    "=== Successful transfer "
+                    "completed. "
+                    "Windows shutdown requested. ==="
+                )
+
+                self.status_label.setText(
+                    "Transfer complete. "
+                    "Windows will shut down..."
+                )
+
+                QApplication.processEvents()
+
+                try:
+
+                    # Normal Windows shutdown.
+                    # Deliberately do NOT use /f.
+                    subprocess.Popen(
+                        [
+                            "shutdown.exe",
+                            "/s",
+                            "/t",
+                            "30",
+                            "/c",
+                            "Safe Transfer completed successfully.",
+                        ],
+                        creationflags=(
+                            getattr(
+                                subprocess,
+                                "CREATE_NO_WINDOW",
+                                0,
+                            )
+                        ),
+                    )
+
+                except Exception as e:
+
+                    self.append_log(
+                        "SHUTDOWN ERROR: "
+                        f"{e}"
+                    )
+
+                    QMessageBox.critical(
+                        self,
+                        "Shutdown Error",
+                        (
+                            "The transfer completed, "
+                            "but Windows shutdown "
+                            "could not be requested.\n\n"
+                            f"{e}"
+                        ),
+                    )
+
+        self.current_operation = None
+
+    # ==================================================================
+    # ERROR HANDLING
+    # ==================================================================
+
+    def operation_error(
+        self,
+        message,
+    ):
+
+        self.append_log(
+            f"ERROR: {message}"
+        )
+
+        self.status_label.setText(
+            "Operation failed."
         )
 
         QMessageBox.critical(
             self,
-            "Transfer Error",
-            error,
+            "Operation Error",
+            message,
         )
 
-    # ========================================================
-    # Thread Cleanup
-    # ========================================================
+    def worker_finished(self):
 
-    def _transfer_thread_finished(self):
+        self.worker = None
 
-        self.transfer_thread = None
-
-        self.transfer_worker = None
-
-    # ========================================================
-    # UI Transfer State
-    # ========================================================
-
-    def set_transfer_running(
-        self,
-        running: bool,
-    ):
-
-        self.start_button.setEnabled(
-            not running
-        )
-
-        self.resume_button.setEnabled(
-            not running
+        self.set_controls_enabled(
+            True
         )
 
         self.pause_button.setEnabled(
-            running
+            False
         )
 
-        self.cancel_button.setEnabled(
-            running
+        state = load_state()
+
+        self.resume_button.setEnabled(
+            bool(
+                state
+                and state.get(
+                    "Paused",
+                    False,
+                )
+            )
         )
 
-        self.scan_button.setEnabled(
-            not running
-        )
+    # ==================================================================
+    # WINDOW CLOSE
+    # ==================================================================
 
-        self.source_edit.setEnabled(
-            not running
-        )
+    def closeEvent(
+        self,
+        event,
+    ):
 
-        self.destination_edit.setEnabled(
-            not running
-        )
+        if (
+            self.worker
+            and self.worker.isRunning()
+        ):
 
-        self.copy_radio.setEnabled(
-            not running
-        )
-
-        self.move_radio.setEnabled(
-            not running
-        )
-
-        self.order_combo.setEnabled(
-            not running
-        )
-
-        self.skip_existing_checkbox.setEnabled(
-            not running
-        )
-
-        self.verify_checkbox.setEnabled(
-            not running
-        )
-
-    # ========================================================
-    # Close Event
-    # ========================================================
-
-    def closeEvent(self, event):
-
-        if self.transfer_worker:
-
-            result = QMessageBox.question(
+            answer = QMessageBox.question(
                 self,
-                "Transfer Running",
+                "Operation Running",
                 (
-                    "A transfer is currently running.\n\n"
-                    "Do you want to pause it before closing?"
+                    "A file operation is actively running.\n\n"
+                    "Closing now will terminate the application "
+                    "while the transfer is still running.\n\n"
+                    "Are you sure you want to exit?"
                 ),
                 QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
+                | QMessageBox.StandardButton.No,
             )
 
             if (
-                result
-                == QMessageBox.StandardButton.Cancel
+                answer
+                != QMessageBox.StandardButton.Yes
             ):
 
                 event.ignore()
 
                 return
-
-            if (
-                result
-                == QMessageBox.StandardButton.Yes
-            ):
-
-                self.transfer_worker.request_pause()
-
-                # Give the worker a moment to save state.
-                QTimer.singleShot(
-                    500,
-                    self.close,
-                )
-
-                event.ignore()
-
-                return
-
-            if (
-                result
-                == QMessageBox.StandardButton.No
-            ):
-
-                self.transfer_worker.request_cancel()
 
         event.accept()
 
 
-# ============================================================
-# Application
-# ============================================================
+# ======================================================================
+# APPLICATION ENTRY POINT
+# ======================================================================
 
 def main():
 
@@ -2779,10 +3838,10 @@ def main():
     )
 
     app.setApplicationName(
-        "Safe Transfer"
+        "Windows File Copy Move Assistant"
     )
 
-    window = MainWindow()
+    window = FileManagerGUI()
 
     window.show()
 
@@ -2792,4 +3851,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
