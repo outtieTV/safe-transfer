@@ -1,2 +1,2 @@
 # safe-transfer
-Safe-transfer is a powershell script for transferring files more safely.
+Safe-transfer is a python script for transferring files more safely.
