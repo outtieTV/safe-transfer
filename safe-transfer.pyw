@@ -1071,6 +1071,8 @@ class TransferWorker(QThread):
 
     statistics = pyqtSignal(str)
 
+    eta_updated = pyqtSignal(str, str)
+
     log = pyqtSignal(str)
 
     finished_result = pyqtSignal(dict)
@@ -1747,21 +1749,21 @@ class TransferWorker(QThread):
 
             completion_text = "—"
 
+        # Keep the general transfer statistics separate from the ETA.
         self.statistics.emit(
-            f"Files: "
-            f"{completed:,}/{total:,}"
+            f"Files: {completed:,}/{total:,}"
             f"    |    "
             f"Transferred: "
             f"{human_bytes(self.bytes_copied)}"
             f" / "
             f"{human_bytes(self.total_bytes)}"
             f"    |    "
-            f"Speed: "
-            f"{human_bytes(speed)}/s"
-            f"    |    "
-            f"ETA: {eta_text}"
-            f"    |    "
-            f"Done: {completion_text}"
+            f"Speed: {human_bytes(speed)}/s"
+        )
+
+        self.eta_updated.emit(
+            eta_text,
+            completion_text,
         )
 
 
@@ -2112,6 +2114,94 @@ class FileManagerGUI(QWidget):
         )
 
         # --------------------------------------------------------------
+        # TRANSFER STATISTICS
+        # --------------------------------------------------------------
+
+        self.transfer_stats_group = QGroupBox(
+            "Transfer Statistics"
+        )
+
+        transfer_stats_layout = QVBoxLayout()
+
+        self.transfer_stats_label = QLabel(
+            "Files: —    |    "
+            "Transferred: —    |    "
+            "Speed: —"
+        )
+
+        self.transfer_stats_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.transfer_stats_label.setWordWrap(
+            True
+        )
+
+        transfer_stats_layout.addWidget(
+            self.transfer_stats_label
+        )
+
+        self.transfer_stats_group.setLayout(
+            transfer_stats_layout
+        )
+
+        # --------------------------------------------------------------
+        # ETA
+        # --------------------------------------------------------------
+
+        self.eta_group = QGroupBox(
+            "Estimated Completion"
+        )
+
+        eta_layout = QVBoxLayout()
+
+        self.eta_label = QLabel(
+            "ETA: —"
+        )
+
+        self.eta_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.eta_label.setWordWrap(
+            True
+        )
+
+        self.completion_label = QLabel(
+            "Expected completion: —"
+        )
+
+        self.completion_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.completion_label.setWordWrap(
+            True
+        )
+
+        eta_layout.addWidget(
+            self.eta_label
+        )
+
+        eta_layout.addWidget(
+            self.completion_label
+        )
+
+        self.eta_group.setLayout(
+            eta_layout
+        )
+
+        transfer_info_layout = QHBoxLayout()
+
+        transfer_info_layout.addWidget(
+            self.transfer_stats_group
+        )
+
+        transfer_info_layout.addWidget(
+            self.eta_group
+        )
+
+        # --------------------------------------------------------------
         # STATUS
         # --------------------------------------------------------------
 
@@ -2196,6 +2286,10 @@ class FileManagerGUI(QWidget):
 
         main.addWidget(
             self.progress
+        )
+
+        main.addLayout(
+            transfer_info_layout
         )
 
         main.addLayout(
@@ -3016,6 +3110,20 @@ class FileManagerGUI(QWidget):
             0
         )
 
+        self.transfer_stats_label.setText(
+            "Files: —    |    "
+            "Transferred: —    |    "
+            "Speed: —"
+        )
+
+        self.eta_label.setText(
+            "ETA: —"
+        )
+
+        self.completion_label.setText(
+            "Expected completion: —"
+        )
+
         self.status_label.setText(
             "Starting transfer..."
         )
@@ -3057,7 +3165,11 @@ class FileManagerGUI(QWidget):
         )
 
         self.worker.statistics.connect(
-            self.status_label.setText
+            self.transfer_stats_label.setText
+        )
+
+        self.worker.eta_updated.connect(
+            self.update_eta_display
         )
 
         self.worker.log.connect(
@@ -3376,6 +3488,21 @@ class FileManagerGUI(QWidget):
                 True
             )
 
+    def update_eta_display(
+        self,
+        eta_text,
+        completion_text,
+    ):
+        """Update the dedicated ETA / estimated completion box."""
+
+        self.eta_label.setText(
+            f"ETA: {eta_text}"
+        )
+
+        self.completion_label.setText(
+            f"Expected completion: {completion_text}"
+        )
+
     # ==================================================================
     # TRANSFER COMPLETION
     # ==================================================================
@@ -3640,6 +3767,15 @@ class FileManagerGUI(QWidget):
         self.status_label.setText(
             "Operation completed."
         )
+
+        if success and not failed:
+            self.eta_label.setText(
+                "ETA: Complete"
+            )
+
+            self.completion_label.setText(
+                "Expected completion: Completed"
+            )
 
         if failed:
 
