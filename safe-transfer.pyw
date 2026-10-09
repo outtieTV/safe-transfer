@@ -80,6 +80,7 @@ except ImportError:
 from PyQt6.QtCore import (
     Qt,
     QThread,
+    QTimer,
     pyqtSignal,
 )
 
@@ -97,6 +98,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QCheckBox,
     QComboBox,
+    QListWidget,
+    QListWidgetItem,
     QGroupBox,
 )
 
@@ -1967,6 +1970,12 @@ class FileManagerGUI(QWidget):
 
         self.current_operation = None
 
+        # Sequential task queue. Tasks are held in memory for this session.
+        self.task_queue = []
+        self.queue_running = False
+        self.queue_current_task = None
+        self.queue_task_number = 0
+
         # --------------------------------------------------------------
         # SOURCE
         # --------------------------------------------------------------
@@ -2181,6 +2190,42 @@ class FileManagerGUI(QWidget):
         options_group.setLayout(
             options_layout
         )
+
+        # --------------------------------------------------------------
+        # TASK QUEUE
+        # --------------------------------------------------------------
+
+        queue_group = QGroupBox("Task Queue")
+        queue_layout = QVBoxLayout()
+        self.task_queue_list = QListWidget()
+        self.task_queue_list.setMinimumHeight(110)
+        self.task_queue_list.setToolTip(
+            "Queue tasks using the current source, destination, and operation. "
+            "Tasks run sequentially when the queue is started."
+        )
+        queue_layout.addWidget(self.task_queue_list)
+
+        queue_buttons = QHBoxLayout()
+        self.queue_add_button = QPushButton("Task Queue Add")
+        self.queue_add_button.clicked.connect(self.task_queue_add)
+        self.queue_list_button = QPushButton("Task Queue List / Refresh")
+        self.queue_list_button.clicked.connect(self.task_queue_list_tasks)
+        self.queue_remove_button = QPushButton("Task Queue Cancel / Remove")
+        self.queue_remove_button.clicked.connect(self.task_queue_remove)
+        self.queue_start_button = QPushButton("Task Queue Start")
+        self.queue_start_button.clicked.connect(self.task_queue_start)
+        self.queue_stop_button = QPushButton("Task Queue Stop")
+        self.queue_stop_button.clicked.connect(self.task_queue_stop)
+        queue_buttons.addWidget(self.queue_add_button)
+        queue_buttons.addWidget(self.queue_list_button)
+        queue_buttons.addWidget(self.queue_remove_button)
+        queue_buttons.addWidget(self.queue_start_button)
+        queue_buttons.addWidget(self.queue_stop_button)
+        queue_layout.addLayout(queue_buttons)
+        self.queue_status_label = QLabel("Queue stopped. 0 pending task(s).")
+        self.queue_status_label.setWordWrap(True)
+        queue_layout.addWidget(self.queue_status_label)
+        queue_group.setLayout(queue_layout)
 
         # --------------------------------------------------------------
         # BUTTONS
@@ -2447,6 +2492,8 @@ class FileManagerGUI(QWidget):
             options_group
         )
 
+        main.addWidget(queue_group)
+
         main.addWidget(
             self.stats_label
         )
@@ -2480,6 +2527,191 @@ class FileManagerGUI(QWidget):
         )
 
         self.check_resume_state()
+
+    # ==================================================================
+    # TASK QUEUE
+    # ==================================================================
+
+    def task_queue_add(self):
+        """Snapshot the current transfer settings into the pending queue."""
+        source_text = self.source_edit.text().strip()
+        destination_text = self.destination_edit.text().strip()
+        if not source_text or not destination_text:
+            QMessageBox.warning(self, "Task Queue", "Choose both a source and destination first.")
+            return
+        source = Path(source_text).expanduser()
+        destination = Path(destination_text).expanduser()
+        if not source.exists() or not source.is_dir():
+            QMessageBox.warning(self, "Task Queue", f"Source folder does not exist:\n{source}")
+            return
+        try:
+            source_resolved = source.resolve()
+            destination_resolved = destination.resolve()
+            if source_resolved == destination_resolved:
+                QMessageBox.warning(self, "Task Queue", "Source and destination cannot be the same folder.")
+                return
+            if source_resolved in destination_resolved.parents:
+                QMessageBox.warning(self, "Task Queue", "Destination cannot be inside the source folder.")
+                return
+        except Exception:
+            pass
+        task = {
+            "source": str(source),
+            "destination": str(destination),
+            "operation": self.operation_combo.currentText(),
+            "sort": self.sort_combo.currentText(),
+            "skip_existing": self.skip_existing.isChecked(),
+            "ignore_space": self.ignore_space.isChecked(),
+            "verify_files": self.verify_files.isChecked(),
+            "shutdown_on_complete": self.shutdown_on_complete.isChecked(),
+            "status": "Pending",
+        }
+        self.task_queue.append(task)
+        self.task_queue_refresh()
+        self.append_log(f"TASK QUEUE ADD: {task['operation']} | {task['source']} -> {task['destination']}")
+
+    def task_queue_refresh(self):
+        self.task_queue_list.clear()
+        for index, task in enumerate(self.task_queue, start=1):
+            label = (
+                f"{index}. [{task.get('status', 'Pending')}] {task['operation']}\n"
+                f"   {task['source']}  ->  {task['destination']}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, index - 1)
+            self.task_queue_list.addItem(item)
+        active = "running" if self.queue_running else "stopped"
+        self.queue_status_label.setText(f"Queue {active}. {len(self.task_queue)} pending task(s).")
+        self.queue_start_button.setEnabled(bool(self.task_queue) and not self.queue_running)
+        self.queue_stop_button.setEnabled(self.queue_running)
+        self.queue_remove_button.setEnabled(bool(self.task_queue))
+
+    def task_queue_list_tasks(self):
+        self.task_queue_refresh()
+        if self.task_queue:
+            self.append_log(f"TASK QUEUE LIST: {len(self.task_queue)} task(s) pending.")
+            for index, task in enumerate(self.task_queue, start=1):
+                self.append_log(f"  {index}. [{task.get('status', 'Pending')}] {task['operation']} | {task['source']} -> {task['destination']}")
+        else:
+            self.append_log("TASK QUEUE LIST: queue is empty.")
+
+    def task_queue_remove(self):
+        item = self.task_queue_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Task Queue", "Select a pending task to cancel/remove.")
+            return
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if index is None or index < 0 or index >= len(self.task_queue):
+            return
+        task = self.task_queue[index]
+        if task is self.queue_current_task:
+            QMessageBox.warning(self, "Task Queue", "The active task cannot be removed. Stop the queue and let the current operation finish first.")
+            return
+        removed = self.task_queue.pop(index)
+        self.task_queue_refresh()
+        self.append_log(f"TASK QUEUE CANCEL/REMOVE: {removed['operation']} | {removed['source']} -> {removed['destination']}")
+
+    def task_queue_start(self):
+        if self.queue_running:
+            return
+        if not self.task_queue:
+            QMessageBox.information(self, "Task Queue", "The task queue is empty. Add one or more tasks first.")
+            return
+        if self.worker and self.worker.isRunning() or self.scan_worker and self.scan_worker.isRunning():
+            QMessageBox.warning(self, "Task Queue", "Wait for the current standalone operation to finish before starting the queue.")
+            return
+        self.queue_running = True
+        self.append_log(f"=== TASK QUEUE STARTED ({len(self.task_queue)} task(s)) ===")
+        self.task_queue_refresh()
+        self.task_queue_run_next()
+
+    def task_queue_stop(self):
+        """Stop scheduling future tasks; the active transfer is allowed to finish safely."""
+        if not self.queue_running:
+            return
+        self.queue_running = False
+        self.append_log("TASK QUEUE STOP requested. Current task will finish; remaining tasks stay queued.")
+        self.queue_status_label.setText(f"Queue stopped after current task. {len(self.task_queue)} task(s) remain.")
+        self.task_queue_refresh()
+
+    def task_queue_run_next(self):
+        if not self.queue_running:
+            self.queue_current_task = None
+            self.task_queue_refresh()
+            return
+        if self.worker and self.worker.isRunning() or self.scan_worker and self.scan_worker.isRunning():
+            QTimer.singleShot(250, self.task_queue_run_next)
+            return
+        if not self.task_queue:
+            self.queue_running = False
+            self.queue_current_task = None
+            self.append_log("=== TASK QUEUE FINISHED ===")
+            self.queue_status_label.setText("Queue finished. No pending tasks.")
+            self.task_queue_refresh()
+            return
+
+        task = self.task_queue[0]
+        self.queue_current_task = task
+        task["status"] = "Running"
+        self.source_edit.setText(task["source"])
+        self.destination_edit.setText(task["destination"])
+        self.operation_combo.setCurrentText(task["operation"])
+        self.sort_combo.setCurrentText(task["sort"])
+        self.skip_existing.setChecked(task["skip_existing"])
+        self.ignore_space.setChecked(task["ignore_space"])
+        self.verify_files.setChecked(task["verify_files"])
+        # Shutdown is intentionally suppressed for queued jobs; otherwise each job
+        # could shut Windows down before the rest of the queue runs.
+        self.shutdown_on_complete.setChecked(False)
+        self.queue_task_number += 1
+        self.append_log(f"=== TASK QUEUE TASK {self.queue_task_number}: {task['operation']} ===")
+        self.task_queue_refresh()
+        self.start_transfer()
+        # If validation prevents scanning from starting, don't spin forever.
+        if not (self.scan_worker and self.scan_worker.isRunning()) and not (self.worker and self.worker.isRunning()):
+            QTimer.singleShot(250, self._queue_check_start_failure)
+
+    def _queue_check_start_failure(self):
+        if self.queue_running and self.queue_current_task is not None and not (self.scan_worker and self.scan_worker.isRunning()) and not (self.worker and self.worker.isRunning()):
+            self.queue_current_task["status"] = "Failed to start"
+            self.append_log("TASK QUEUE stopped because a task could not start. Review the error and restart the queue when ready.")
+            self.queue_running = False
+            self.queue_current_task = None
+            self.task_queue_refresh()
+
+    def task_queue_complete_current(self, success):
+        """Finalize the active queue item, preserving failed work for retry."""
+        task = self.queue_current_task
+        if task is None:
+            return
+
+        if success:
+            # Remove only a successfully completed task. This prevents a failed
+            # or partially completed operation from silently disappearing.
+            if self.task_queue and self.task_queue[0] is task:
+                self.task_queue.pop(0)
+            elif task in self.task_queue:
+                self.task_queue.remove(task)
+            self.append_log(
+                f"TASK QUEUE COMPLETE: {task['operation']} | "
+                f"{task['source']} -> {task['destination']}"
+            )
+        else:
+            task["status"] = "Failed - retained for retry"
+            self.append_log(
+                "TASK QUEUE stopped after a failed task. The failed task and "
+                "all remaining tasks are still queued; review the error, then "
+                "select Task Queue Start to retry."
+            )
+
+        self.queue_current_task = None
+        if success:
+            if self.queue_running:
+                QTimer.singleShot(300, self.task_queue_run_next)
+        else:
+            self.queue_running = False
+
+        self.task_queue_refresh()
 
     # ==================================================================
     # FOLDER STATISTICS
@@ -3801,6 +4033,12 @@ class FileManagerGUI(QWidget):
             self.append_log(
                 result["message"]
             )
+            if self.queue_current_task is not None:
+                self.queue_current_task["status"] = "Error"
+                self.queue_running = False
+                self.append_log("TASK QUEUE stopped because the current task failed. The task remains queued for review/retry.")
+                self.queue_current_task = None
+                self.task_queue_refresh()
 
             return
 
@@ -4009,18 +4247,19 @@ class FileManagerGUI(QWidget):
                 f"{len(failed):,} failed."
             )
 
-            QMessageBox.warning(
-                self,
-                "Completed With Errors",
-                (
-                    f"Copied: {copied:,}\n"
-                    f"Skipped: {skipped:,}\n"
-                    f"Failed: "
-                    f"{len(failed):,}\n"
-                    f"Transferred: "
-                    f"{human_bytes(bytes_copied)}"
-                ),
-            )
+            if not self.queue_current_task:
+                QMessageBox.warning(
+                    self,
+                    "Completed With Errors",
+                    (
+                        f"Copied: {copied:,}\n"
+                        f"Skipped: {skipped:,}\n"
+                        f"Failed: "
+                        f"{len(failed):,}\n"
+                        f"Transferred: "
+                        f"{human_bytes(bytes_copied)}"
+                    ),
+                )
 
         else:
 
@@ -4030,16 +4269,17 @@ class FileManagerGUI(QWidget):
                 f"Skipped: {skipped:,}"
             )
 
-            QMessageBox.information(
-                self,
-                "Operation Complete",
-                (
-                    f"Copied: {copied:,}\n"
-                    f"Skipped: {skipped:,}\n"
-                    f"Transferred: "
-                    f"{human_bytes(bytes_copied)}"
-                ),
-            )
+            if not self.queue_current_task:
+                QMessageBox.information(
+                    self,
+                    "Operation Complete",
+                    (
+                        f"Copied: {copied:,}\n"
+                        f"Skipped: {skipped:,}\n"
+                        f"Transferred: "
+                        f"{human_bytes(bytes_copied)}"
+                    ),
+                )
 
         if success:
 
@@ -4102,6 +4342,9 @@ class FileManagerGUI(QWidget):
 
         self.current_operation = None
 
+        if self.queue_current_task is not None:
+            self.task_queue_complete_current(bool(success and not failed))
+
     # ==================================================================
     # ERROR HANDLING
     # ==================================================================
@@ -4124,6 +4367,12 @@ class FileManagerGUI(QWidget):
             "Operation Error",
             message,
         )
+        if self.queue_current_task is not None:
+            self.queue_current_task["status"] = "Error"
+            self.queue_running = False
+            self.append_log("TASK QUEUE stopped because the current task encountered an error. The task remains queued for review/retry.")
+            self.queue_current_task = None
+            self.task_queue_refresh()
 
     def worker_finished(self):
 
