@@ -1767,6 +1767,175 @@ class TransferWorker(QThread):
         )
 
 
+
+
+# ======================================================================
+# ROBOCOPY WORKER
+# ======================================================================
+
+class RobocopyWorker(QThread):
+    """Run Windows Robocopy. ROBOCOPY MOVE uses a copy/verify/delete sequence."""
+
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    statistics = pyqtSignal(str)
+    eta_updated = pyqtSignal(str, str)
+    log = pyqtSignal(str)
+    finished_result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, source: Path, destination: Path, files: list,
+                 move: bool, shutdown_on_complete: bool):
+        super().__init__()
+        self.source = Path(source)
+        self.destination = Path(destination)
+        self.files = files
+        self.move = move
+        self.shutdown_on_complete = shutdown_on_complete
+        self.stop_requested = False
+
+    def request_pause(self):
+        self.log.emit("Robocopy cannot be paused safely from this interface.")
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        started = time.monotonic()
+        total_bytes = sum(size for _, size in self.files)
+        total_files = len(self.files)
+        try:
+            if os.name != "nt":
+                raise RuntimeError("Robocopy is only available on Windows.")
+
+            self.destination.mkdir(parents=True, exist_ok=True)
+            self.status.emit("Robocopy: copying files...")
+            self.log.emit(
+                "ROBOCOPY command: robocopy "
+                f'"{self.source}" "{self.destination}" /E /COPY:DAT '
+                "/DCOPY:DAT /R:2 /W:2 /XJ /NP"
+            )
+
+            # Robocopy accepts a source directory and destination directory;
+            # /E includes all subdirectories, including empty ones.
+            command = [
+                "robocopy", str(self.source), str(self.destination),
+                "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:2", "/W:2",
+                "/XJ", "/NP",
+            ]
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="mbcs", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    self.log.emit(f"[ROBOCOPY] {line}")
+                    if len(line) > 4 and not line.startswith((" ", "----", "   ")):
+                        self.status.emit(f"Robocopy: {line[:180]}")
+            proc.wait()
+            # Robocopy codes 0-7 are successful outcomes; 8+ indicate failures.
+            if proc.returncode >= 8:
+                self.finished_result.emit({
+                    "success": False, "paused": False, "copied": 0,
+                    "skipped": 0, "failed": [("Robocopy", f"Exit code {proc.returncode}")],
+                    "bytes": 0, "index": total_files,
+                    "successful_source_files": [],
+                    "shutdown_on_complete": False,
+                })
+                self.log.emit(f"ROBOCOPY FAILED with exit code {proc.returncode}. Source files were not deleted.")
+                return
+
+            # Confirm every listed source file exists at destination and matches
+            # size before deleting anything in ROBOCOPY MOVE mode.
+            if self.move:
+                self.status.emit("Robocopy Move: verifying all copied files before deleting source...")
+                verification_errors = []
+                for index, (src, expected_size) in enumerate(self.files, 1):
+                    try:
+                        relative = Path(src).relative_to(self.source)
+                        dst = self.destination / relative
+                        if not dst.is_file() or dst.stat().st_size != Path(src).stat().st_size:
+                            verification_errors.append((str(relative), "Destination file missing or size mismatch"))
+                    except Exception as exc:
+                        verification_errors.append((str(src), str(exc)))
+                    self.progress.emit(int(index / max(1, total_files) * 90))
+                    self.status.emit(f"Verifying {index:,}/{total_files:,}: {src.name}")
+                if verification_errors:
+                    self.log.emit(
+                        f"ROBOCOPY MOVE: verification failed for {len(verification_errors):,} file(s); "
+                        "no source files were deleted."
+                    )
+                    self.finished_result.emit({
+                        "success": False, "paused": False, "copied": 0,
+                        "skipped": 0, "failed": verification_errors,
+                        "bytes": 0, "index": total_files,
+                        "successful_source_files": [],
+                        "shutdown_on_complete": False,
+                    })
+                    return
+
+                self.status.emit("Robocopy Move: all files verified; deleting source files...")
+                deleted = 0
+                deletion_errors = []
+                for index, (src, _) in enumerate(self.files, 1):
+                    try:
+                        Path(src).unlink(missing_ok=True)
+                        deleted += 1
+                    except Exception as exc:
+                        deletion_errors.append((str(src), str(exc)))
+                    self.progress.emit(90 + int(index / max(1, total_files) * 10))
+                # Remove only empty directories, deepest first. Never recursively
+                # delete source content that was not in the verified file list.
+                for current_root, dirs, _ in os.walk(self.source, topdown=False, followlinks=False):
+                    for dirname in dirs:
+                        directory = Path(current_root) / dirname
+                        try:
+                            if not directory.is_symlink():
+                                directory.rmdir()
+                        except OSError:
+                            pass
+                try:
+                    self.source.rmdir()
+                except OSError:
+                    pass
+                if deletion_errors:
+                    self.finished_result.emit({
+                        "success": False, "paused": False, "copied": total_files - len(deletion_errors),
+                        "skipped": 0, "failed": deletion_errors,
+                        "bytes": total_bytes, "index": total_files,
+                        "successful_source_files": [],
+                        "shutdown_on_complete": False,
+                    })
+                    return
+                self.log.emit(f"ROBOCOPY MOVE completed: verified and deleted {deleted:,} source files.")
+            else:
+                self.progress.emit(100)
+
+            elapsed = max(0.001, time.monotonic() - started)
+            self.statistics.emit(
+                f"Files: {total_files:,}/{total_files:,}    |    "
+                f"Transferred: {human_bytes(total_bytes)}    |    "
+                f"Speed: {human_bytes(total_bytes / elapsed)}/s"
+            )
+            self.eta_updated.emit("Complete", "Completed")
+            self.finished_result.emit({
+                "success": True, "paused": False, "copied": total_files,
+                "skipped": 0, "failed": [], "bytes": total_bytes,
+                "index": total_files, "successful_source_files": [],
+                "shutdown_on_complete": self.shutdown_on_complete,
+            })
+        except Exception as exc:
+            self.log.emit(f"ROBOCOPY ERROR: {exc}")
+            self.finished_result.emit({
+                "success": False, "paused": False, "copied": 0,
+                "skipped": 0, "failed": [("Robocopy", str(exc))],
+                "bytes": 0, "index": 0, "successful_source_files": [],
+                "shutdown_on_complete": False,
+            })
+
+
 # ======================================================================
 # MAIN GUI
 # ======================================================================
@@ -1890,6 +2059,8 @@ class FileManagerGUI(QWidget):
             [
                 "Copy",
                 "Move",
+                "Robocopy Copy",
+                "Robocopy Move",
             ]
         )
 
@@ -2897,9 +3068,10 @@ class FileManagerGUI(QWidget):
 
     def scan_finished(self):
 
-        self.set_controls_enabled(
-            True
-        )
+        # The scan's result signal may start a transfer before this signal
+        # fires; do not re-enable controls while that transfer is running.
+        if not (self.worker and self.worker.isRunning()):
+            self.set_controls_enabled(True)
 
         self.scan_worker = None
 
@@ -3075,15 +3247,68 @@ class FileManagerGUI(QWidget):
                 "file/directory item(s) skipped."
             )
 
-        move = (
-            self.operation_combo.currentText()
-            == "Move"
-        )
+        operation = self.operation_combo.currentText()
+        if operation in ("Robocopy Copy", "Robocopy Move"):
+            self.start_robocopy_with_files(
+                files,
+                move=(operation == "Robocopy Move"),
+            )
+        else:
+            self.start_transfer_with_files(
+                files,
+                move=(operation == "Move"),
+            )
 
-        self.start_transfer_with_files(
-            files,
-            move,
+    def start_robocopy_with_files(self, files, move=False):
+        if not files:
+            self.set_controls_enabled(True)
+            return
+
+        if os.name != "nt":
+            QMessageBox.critical(self, "Robocopy Unavailable",
+                                 "Robocopy modes require Windows.")
+            self.set_controls_enabled(True)
+            return
+
+        if move:
+            answer = QMessageBox.warning(
+                self, "Confirm Robocopy Move",
+                "Robocopy Move will copy the entire source tree, verify that every "
+                "listed file exists at the destination with the same size, and only "
+                "then delete those source files. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.set_controls_enabled(True)
+                return
+
+        self.current_operation = "robocopy"
+        self.progress.setValue(0)
+        self.transfer_stats_label.setText("Robocopy is preparing...")
+        self.eta_label.setText("ETA: —")
+        self.completion_label.setText("Expected completion: —")
+        self.status_label.setText("Starting Robocopy...")
+        self.worker = RobocopyWorker(
+            self.source, self.destination, files, move,
+            self.shutdown_on_complete.isChecked(),
         )
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.statistics.connect(self.transfer_stats_label.setText)
+        self.worker.eta_updated.connect(self.update_eta_display)
+        self.worker.log.connect(self.append_log)
+        self.worker.finished_result.connect(self.transfer_finished)
+        self.worker.error.connect(self.operation_error)
+        self.worker.finished.connect(self.worker_finished)
+        self.set_controls_enabled(False)
+        self.pause_button.setEnabled(False)
+        self.resume_button.setEnabled(False)
+        self.copy_missing_button.setEnabled(False)
+        self.append_log(f"=== ROBOCOPY {'MOVE' if move else 'COPY'} started ===")
+        if self.shutdown_on_complete.isChecked():
+            self.append_log("Shutdown on successful completion: ENABLED")
+        self.worker.start()
 
     def start_transfer_with_files(
         self,
