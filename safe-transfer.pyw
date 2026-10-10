@@ -1975,6 +1975,9 @@ class FileManagerGUI(QWidget):
         self.queue_running = False
         self.queue_current_task = None
         self.queue_task_number = 0
+        # Snapshot this setting when the queue starts. Queue shutdown only
+        # happens after natural successful completion, never after Stop/failure.
+        self.queue_shutdown_after_all = False
 
         # --------------------------------------------------------------
         # SOURCE
@@ -2170,7 +2173,11 @@ class FileManagerGUI(QWidget):
         row2 = QHBoxLayout()
 
         self.shutdown_on_complete = QCheckBox(
-            "Shutdown computer when transfer completes successfully"
+            "Shutdown after current task finishes"
+        )
+        self.shutdown_on_complete.setToolTip(
+            "For a standalone transfer, request Windows shutdown after this task "
+            "finishes successfully. Queued jobs use the separate queue-wide option."
         )
 
         row2.addWidget(
@@ -2197,6 +2204,15 @@ class FileManagerGUI(QWidget):
 
         queue_group = QGroupBox("Task Queue")
         queue_layout = QVBoxLayout()
+        self.shutdown_after_all_tasks = QCheckBox(
+            "Shutdown after all tasks finish successfully"
+        )
+        self.shutdown_after_all_tasks.setToolTip(
+            "When enabled before starting the queue, request Windows shutdown "
+            "only after every queued task completes successfully. Shutdown is "
+            "not requested if the queue is stopped or a task fails."
+        )
+        queue_layout.addWidget(self.shutdown_after_all_tasks)
         self.task_queue_list = QListWidget()
         self.task_queue_list.setMinimumHeight(110)
         self.task_queue_list.setToolTip(
@@ -2621,7 +2637,12 @@ class FileManagerGUI(QWidget):
             QMessageBox.warning(self, "Task Queue", "Wait for the current standalone operation to finish before starting the queue.")
             return
         self.queue_running = True
+        self.queue_shutdown_after_all = self.shutdown_after_all_tasks.isChecked()
         self.append_log(f"=== TASK QUEUE STARTED ({len(self.task_queue)} task(s)) ===")
+        self.append_log(
+            "Queue-wide shutdown after successful completion: "
+            + ("ENABLED" if self.queue_shutdown_after_all else "DISABLED")
+        )
         self.task_queue_refresh()
         self.task_queue_run_next()
 
@@ -2643,11 +2664,17 @@ class FileManagerGUI(QWidget):
             QTimer.singleShot(250, self.task_queue_run_next)
             return
         if not self.task_queue:
+            # Reaching this branch while queue_running is True means the queue
+            # drained naturally. A stopped or failed queue returns above and
+            # therefore cannot trigger queue-wide shutdown.
             self.queue_running = False
             self.queue_current_task = None
-            self.append_log("=== TASK QUEUE FINISHED ===")
-            self.queue_status_label.setText("Queue finished. No pending tasks.")
+            self.append_log("=== TASK QUEUE FINISHED SUCCESSFULLY ===")
+            self.queue_status_label.setText("Queue finished successfully. No pending tasks.")
             self.task_queue_refresh()
+            if self.queue_shutdown_after_all:
+                self.request_windows_shutdown("all queued tasks completed successfully")
+            self.queue_shutdown_after_all = False
             return
 
         task = self.task_queue[0]
@@ -4213,6 +4240,39 @@ class FileManagerGUI(QWidget):
                 ),
             )
 
+    def request_windows_shutdown(self, reason):
+        """Request a normal Windows shutdown after a successful operation."""
+        self.append_log(
+            "=== Shutdown requested: "
+            f"{reason}. Windows shutdown countdown started. ==="
+        )
+        self.status_label.setText(
+            "Task complete. Windows will shut down in 30 seconds..."
+        )
+        QApplication.processEvents()
+
+        try:
+            # Normal Windows shutdown. Deliberately do NOT use /f.
+            subprocess.Popen(
+                [
+                    "shutdown.exe",
+                    "/s",
+                    "/t",
+                    "30",
+                    "/c",
+                    "Safe Transfer completed successfully.",
+                ],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as e:
+            self.append_log(f"SHUTDOWN ERROR: {e}")
+            QMessageBox.critical(
+                self,
+                "Shutdown Error",
+                "The task(s) completed, but Windows shutdown could not be requested.\n\n"
+                f"{e}",
+            )
+
     def finish_transfer_ui(
         self,
         copied,
@@ -4286,59 +4346,7 @@ class FileManagerGUI(QWidget):
             delete_state()
 
             if shutdown_on_complete:
-
-                self.append_log(
-                    "=== Successful transfer "
-                    "completed. "
-                    "Windows shutdown requested. ==="
-                )
-
-                self.status_label.setText(
-                    "Transfer complete. "
-                    "Windows will shut down..."
-                )
-
-                QApplication.processEvents()
-
-                try:
-
-                    # Normal Windows shutdown.
-                    # Deliberately do NOT use /f.
-                    subprocess.Popen(
-                        [
-                            "shutdown.exe",
-                            "/s",
-                            "/t",
-                            "30",
-                            "/c",
-                            "Safe Transfer completed successfully.",
-                        ],
-                        creationflags=(
-                            getattr(
-                                subprocess,
-                                "CREATE_NO_WINDOW",
-                                0,
-                            )
-                        ),
-                    )
-
-                except Exception as e:
-
-                    self.append_log(
-                        "SHUTDOWN ERROR: "
-                        f"{e}"
-                    )
-
-                    QMessageBox.critical(
-                        self,
-                        "Shutdown Error",
-                        (
-                            "The transfer completed, "
-                            "but Windows shutdown "
-                            "could not be requested.\n\n"
-                            f"{e}"
-                        ),
-                    )
+                self.request_windows_shutdown("the current task completed successfully")
 
         self.current_operation = None
 
