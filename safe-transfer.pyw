@@ -25,6 +25,8 @@ PyQt6 application providing:
     • Source / destination filesystem statistics
     • Persistent logging
     • JSON pause/resume state
+    • INI-based crash recovery (RESUME ON CRASH)
+    • Single/multiple file and folder sources
     • Per-file error handling
     • Optional file-size verification
     • Background worker threads
@@ -66,6 +68,7 @@ import json
 import time
 import shutil
 import subprocess
+import configparser
 
 from pathlib import Path
 from datetime import datetime
@@ -115,6 +118,33 @@ LOG_FILE = Path.home() / "copy_move_history.txt"
 STATE_FILE = SCRIPT_DIR / ".pauseResumeState.json"
 
 SIZE_LIST_FILE = SCRIPT_DIR / "transfer_file_sizes.txt"
+RESUME_INI_FILE = SCRIPT_DIR / "safe_transfer_resume.ini"
+
+
+def write_resume_ini(values: dict):
+    """Atomically persist crash-resume information in an INI file."""
+    cfg = configparser.ConfigParser()
+    cfg["resume"] = {str(k): str(v) for k, v in values.items()}
+    tmp = RESUME_INI_FILE.with_suffix(".ini.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            cfg.write(f)
+        tmp.replace(RESUME_INI_FILE)
+    except Exception as exc:
+        append_log(f"RESUME INI SAVE ERROR: {exc}")
+
+
+def read_resume_ini():
+    cfg = configparser.ConfigParser()
+    try:
+        if not RESUME_INI_FILE.exists():
+            return None
+        cfg.read(RESUME_INI_FILE, encoding="utf-8")
+        return dict(cfg["resume"]) if cfg.has_section("resume") else None
+    except Exception as exc:
+        append_log(f"RESUME INI READ ERROR: {exc}")
+        return None
+
 
 
 # ======================================================================
@@ -1729,6 +1759,12 @@ class TransferWorker(QThread):
             / total
             * 100
         )
+        # Persist the next file index frequently so a hard crash can resume.
+        ini = read_resume_ini() or {}
+        if ini:
+            ini["index"] = str(completed)
+            ini["status"] = "running"
+            write_resume_ini(ini)
 
         self.progress.emit(
             percent
@@ -1969,6 +2005,9 @@ class FileManagerGUI(QWidget):
         self.missing_files = []
 
         self.current_operation = None
+        self.resume_start_index = 0
+        self.crash_resume_pending = False
+        self.selected_source_paths = []
 
         # Sequential task queue. Tasks are held in memory for this session.
         self.task_queue = []
@@ -1983,33 +2022,21 @@ class FileManagerGUI(QWidget):
         # SOURCE
         # --------------------------------------------------------------
 
+        self.source_type_combo = QComboBox()
+        self.source_type_combo.addItems([
+            "Single Folder", "Multiple Folders", "Single File", "Multiple Files"
+        ])
         self.source_edit = QLineEdit()
-
         self.source_edit.setPlaceholderText(
-            "Source folder..."
+            "Source path(s); multiple paths are separated by semicolons..."
         )
-
-        self.source_button = QPushButton(
-            "Browse..."
-        )
-
-        self.source_button.clicked.connect(
-            self.browse_source
-        )
-
+        self.source_button = QPushButton("Browse...")
+        self.source_button.clicked.connect(self.browse_source)
         source_layout = QHBoxLayout()
-
-        source_layout.addWidget(
-            QLabel("Source:")
-        )
-
-        source_layout.addWidget(
-            self.source_edit
-        )
-
-        source_layout.addWidget(
-            self.source_button
-        )
+        source_layout.addWidget(QLabel("Source type:"))
+        source_layout.addWidget(self.source_type_combo)
+        source_layout.addWidget(self.source_edit)
+        source_layout.addWidget(self.source_button)
 
         # --------------------------------------------------------------
         # DESTINATION
@@ -2299,6 +2326,12 @@ class FileManagerGUI(QWidget):
             self.resume_operation
         )
 
+        self.resume_crash_button = QPushButton("RESUME ON CRASH")
+        self.resume_crash_button.setToolTip(
+            "Restore the last operation from safe_transfer_resume.ini and resume from its saved file index."
+        )
+        self.resume_crash_button.clicked.connect(self.resume_after_crash)
+
         button_layout = QHBoxLayout()
 
         button_layout.addWidget(
@@ -2320,6 +2353,7 @@ class FileManagerGUI(QWidget):
         button_layout.addWidget(
             self.resume_button
         )
+        button_layout.addWidget(self.resume_crash_button)
 
         # --------------------------------------------------------------
         # STATISTICS
@@ -3036,17 +3070,33 @@ class FileManagerGUI(QWidget):
     # ==================================================================
 
     def browse_source(self):
-
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Select Source Folder",
-        )
-
-        if directory:
-
-            self.source_edit.setText(
-                directory
-            )
+        mode = self.source_type_combo.currentText()
+        if mode == "Single Folder":
+            value = QFileDialog.getExistingDirectory(self, "Select Source Folder")
+            paths = [value] if value else []
+        elif mode == "Multiple Folders":
+            QMessageBox.information(self, "Select folders",
+                "Choose folders one at a time. Click Cancel when finished.")
+            paths = []
+            while True:
+                value = QFileDialog.getExistingDirectory(self, "Select a Source Folder")
+                if not value:
+                    break
+                if value not in paths:
+                    paths.append(value)
+                answer = QMessageBox.question(self, "Add another folder?",
+                    "Add another source folder?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)
+                if answer != QMessageBox.StandardButton.Yes:
+                    break
+        elif mode == "Single File":
+            value, _ = QFileDialog.getOpenFileName(self, "Select Source File")
+            paths = [value] if value else []
+        else:
+            values, _ = QFileDialog.getOpenFileNames(self, "Select Source Files")
+            paths = values
+        if paths:
+            self.source_edit.setText(";".join(paths))
 
     def browse_destination(self):
 
@@ -3414,43 +3464,89 @@ class FileManagerGUI(QWidget):
 
             return
 
-        source, destination = (
-            self.get_paths()
-        )
-
-        if not source:
+        mode = self.source_type_combo.currentText()
+        raw_paths = [x.strip().strip('"') for x in self.source_edit.text().split(";") if x.strip()]
+        if not raw_paths:
+            QMessageBox.warning(self, "Invalid Source", "Select or enter at least one source path.")
             return
-
+        paths = [Path(x) for x in raw_paths]
+        if any(not x.exists() for x in paths):
+            QMessageBox.warning(self, "Invalid Source", "One or more source paths do not exist.")
+            return
+        if mode == "Single Folder" and (len(paths) != 1 or not paths[0].is_dir()):
+            QMessageBox.warning(self, "Invalid Source", "Single Folder mode requires one folder.")
+            return
+        if mode == "Multiple Folders" and any(not x.is_dir() for x in paths):
+            QMessageBox.warning(self, "Invalid Source", "Multiple Folders mode accepts folders only.")
+            return
+        if mode in ("Single File", "Multiple Files") and any(not x.is_file() for x in paths):
+            QMessageBox.warning(self, "Invalid Source", "File source mode accepts files only.")
+            return
+        if mode == "Single File" and len(paths) != 1:
+            QMessageBox.warning(self, "Invalid Source", "Single File mode requires one file.")
+            return
+        destination_text = self.destination_edit.text().strip()
+        if not destination_text:
+            QMessageBox.warning(self, "Missing Destination", "Please select a destination folder.")
+            return
+        destination = Path(destination_text)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            common = Path(os.path.commonpath([str(x if x.is_dir() else x.parent) for x in paths]))
+            if common.is_file(): common = common.parent
+            if any(x.resolve() == destination.resolve() for x in paths if x.is_dir()):
+                raise ValueError("Source and destination cannot be the same folder.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid Paths", str(exc))
+            return
+        source = common
+        self.selected_source_paths = paths
         self.source = source
-
-        self.destination = (
-            destination
-        )
-
-        self.append_log(
-            "=== Building file list ==="
-        )
-
-        self.set_controls_enabled(
-            False
-        )
-
-        self.progress.setValue(
-            0
-        )
-
-        self.status_label.setText(
-            "Scanning source directory..."
-        )
-
-        sort_mode = (
-            self.sort_combo.currentText()
-        )
-
-        self.scan_worker = FileScanner(
-            source,
-            sort_mode,
-        )
+        self.destination = destination
+        resume_index = self.resume_start_index if self.crash_resume_pending else 0
+        if not self.crash_resume_pending:
+            self.resume_start_index = 0
+        write_resume_ini({
+            "source_type": mode, "source_paths": json.dumps([str(x) for x in paths]),
+            "source": str(source), "destination": str(destination),
+            "operation": self.operation_combo.currentText(), "index": resume_index,
+            "sort_mode": self.sort_combo.currentText(),
+            "skip_existing": self.skip_existing.isChecked(),
+            "ignore_space": self.ignore_space.isChecked(),
+            "verify_files": self.verify_files.isChecked(),
+            "shutdown_on_complete": self.shutdown_on_complete.isChecked(),
+            "status": "running",
+        })
+        self.crash_resume_pending = False
+        self.append_log("=== Building file list ===")
+        self.set_controls_enabled(False)
+        self.progress.setValue(0)
+        self.status_label.setText("Scanning source path(s)...")
+        sort_mode = self.sort_combo.currentText()
+        if mode == "Single Folder":
+            self.scan_worker = FileScanner(source, sort_mode)
+        else:
+            files = []
+            seen = set()
+            for item in paths:
+                candidates = [item] if item.is_file() else []
+                if item.is_dir():
+                    for root, dirs, names in os.walk(item, followlinks=False):
+                        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+                        candidates.extend(Path(root) / n for n in names)
+                for candidate in candidates:
+                    try:
+                        if candidate.is_symlink(): continue
+                        resolved = str(candidate.resolve()).casefold()
+                        if resolved in seen: continue
+                        seen.add(resolved)
+                        files.append((candidate, candidate.stat().st_size))
+                    except OSError as exc:
+                        self.append_log(f"SCAN WARNING: {candidate}: {exc}")
+            reverse = sort_mode == "Largest → Smallest"
+            files.sort(key=lambda x: x[1], reverse=reverse)
+            self.file_list_ready(files, len(files), 0)
+            return
 
         self.scan_worker.progress.connect(
             self.progress.setValue
@@ -3516,6 +3612,7 @@ class FileManagerGUI(QWidget):
             self.start_transfer_with_files(
                 files,
                 move=(operation == "Move"),
+                start_index=self.resume_start_index,
             )
 
     def start_robocopy_with_files(self, files, move=False):
@@ -3711,6 +3808,42 @@ class FileManagerGUI(QWidget):
     # ==================================================================
     # PAUSE / RESUME
     # ==================================================================
+
+    def resume_after_crash(self):
+        """Restore the last operation from the INI and restart at its saved index."""
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "Busy", "An operation is currently running.")
+            return
+        data = read_resume_ini()
+        if not data:
+            QMessageBox.warning(self, "No Resume Data", f"No usable resume INI found at:\n{RESUME_INI_FILE}")
+            return
+        try:
+            paths = json.loads(data.get("source_paths", "[]"))
+            if not paths:
+                paths = [data["source"]]
+            missing = [p for p in paths if not Path(p).exists()]
+            if missing:
+                QMessageBox.critical(self, "Resume Error", "Source path(s) no longer exist:\n" + "\n".join(missing))
+                return
+            index = max(0, int(data.get("index", "0")))
+            mode = data.get("source_type", "Single Folder")
+            self.source_type_combo.setCurrentText(mode)
+            self.source_edit.setText(";".join(paths))
+            self.destination_edit.setText(data.get("destination", ""))
+            self.operation_combo.setCurrentText(data.get("operation", "Copy"))
+            self.sort_combo.setCurrentText(data.get("sort_mode", "Largest → Smallest"))
+            self.skip_existing.setChecked(data.get("skip_existing", "False").lower() == "true")
+            self.ignore_space.setChecked(data.get("ignore_space", "False").lower() == "true")
+            self.verify_files.setChecked(data.get("verify_files", "True").lower() == "true")
+            self.shutdown_on_complete.setChecked(data.get("shutdown_on_complete", "False").lower() == "true")
+            self.resume_start_index = index
+            self.crash_resume_pending = True
+            self.append_log(f"Crash resume requested: {index:,} file(s) already completed.")
+            self.start_transfer()
+        except Exception as exc:
+            self.crash_resume_pending = False
+            QMessageBox.critical(self, "Resume Error", f"Could not restore resume data:\n\n{exc}")
 
     def pause_operation(self):
 
@@ -4148,41 +4281,23 @@ class FileManagerGUI(QWidget):
                 )
 
         try:
-
             directories = []
-
-            for current_root, dirs, files in os.walk(
-                self.source,
-                topdown=False,
-                followlinks=False,
-            ):
-
-                for dirname in dirs:
-
-                    directory = (
-                        Path(current_root)
-                        / dirname
-                    )
-
-                    if directory.is_symlink():
-                        continue
-
-                    directories.append(
-                        directory
-                    )
-
-            directories.append(
-                self.source
-            )
+            # Only clean up the source tree for single-folder moves. For
+            # file/multi-source modes, self.source may be a shared parent.
+            if self.source_type_combo.currentText() == "Single Folder":
+                for current_root, dirs, files in os.walk(
+                    self.source, topdown=False, followlinks=False
+                ):
+                    for dirname in dirs:
+                        directory = Path(current_root) / dirname
+                        if not directory.is_symlink():
+                            directories.append(directory)
+                directories.append(self.source)
 
             for directory in directories:
-
                 try:
-
                     directory.rmdir()
-
                 except OSError:
-
                     pass
 
         except Exception as e:
@@ -4344,6 +4459,11 @@ class FileManagerGUI(QWidget):
         if success:
 
             delete_state()
+            ini = read_resume_ini() or {}
+            if ini:
+                ini["status"] = "completed"
+                ini["index"] = ini.get("index", "0")
+                write_resume_ini(ini)
 
             if shutdown_on_complete:
                 self.request_windows_shutdown("the current task completed successfully")
